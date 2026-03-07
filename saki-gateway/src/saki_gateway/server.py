@@ -1,0 +1,1013 @@
+from __future__ import annotations
+
+import base64
+import copy
+import json
+import mimetypes
+import sys
+from dataclasses import asdict
+from datetime import datetime
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
+from urllib.parse import parse_qs, urlparse
+
+from .config import ConfigStore, default_config_path
+from .config import normalize_dashboard_password
+from .llm import extract_text_content, request_chat_completion, stream_chat_completion
+from .memory import MemoryStore
+from .runtime_store import RuntimeStore
+from .scheduler import GatewayScheduler
+from .tools import (
+    build_default_registry,
+    prepare_image_context,
+    prepare_search_context,
+    prepare_shared_link_context,
+)
+
+
+class GatewayApp:
+    def __init__(self, root: Path):
+        self.root = root
+        self.dashboard_root = self._find_dashboard_root()
+        self.config_store = ConfigStore(default_config_path(root))
+        self.memory_store = MemoryStore(
+            root / self.config_store.config.memory.database_path.replace("./", ""),
+            vector_weight=self.config_store.config.memory.vector_weight,
+            keyword_weight=self.config_store.config.memory.keyword_weight,
+        )
+        self.runtime_store = RuntimeStore(
+            root / self.config_store.config.memory.operational_db_path.replace("./", ""),
+            root / self.config_store.config.memory.event_log_path.replace("./", ""),
+        )
+        self.tools = build_default_registry(
+            root,
+            lambda: self.config_store.config,
+            memory_store=self.memory_store,
+            runtime_store=self.runtime_store,
+            dispatch_message=self.dispatch_proactive_message,
+        )
+        self._ensure_context_files(refresh=True)
+        self.feishu_channel = self._build_feishu_channel()
+        self.scheduler = GatewayScheduler(
+            self.runtime_store,
+            lambda: self.config_store.config.scheduler,
+            self._deliver_due_reminder,
+            self._send_idle_proactive_ping,
+        )
+
+    def state(self) -> Dict[str, Any]:
+        config = self.config_store.config
+        return {
+            "host": config.host,
+            "port": config.port,
+            "persona": config.persona.partner_name,
+            "enabled_tools": self.tools.list_enabled(),
+            "memory_count": len(self.memory_store.list_memories(limit=1000)),
+            "memory_enabled": config.memory.enabled,
+            "runtime": self.runtime_store.stats(),
+            "channels": {
+                "feishu": self.feishu_channel.status() if self.feishu_channel else {"enabled": False, "ready": False},
+            },
+            "scheduler": self.scheduler.status(),
+            "dashboard": {
+                "enabled": self.dashboard_root is not None,
+                "root": str(self.dashboard_root) if self.dashboard_root else "",
+            },
+            "context_files": {
+                "core_profile": str(self._core_memory_file()),
+                "active_memory": str(self._active_memory_file()),
+                "event_log": str(self.root / self.config_store.config.memory.event_log_path.replace("./", "")),
+            },
+        }
+
+    def public_config_payload(self) -> Dict[str, Any]:
+        payload = asdict(self.config_store.config)
+        dashboard_security = payload.get("dashboard_security") or {}
+        dashboard_security["password"] = ""
+        payload["dashboard_security"] = dashboard_security
+        return payload
+
+    def start_channels(self) -> None:
+        if self.feishu_channel is not None:
+            self.feishu_channel.start(self.handle_feishu_message)
+        self.scheduler.start()
+
+    def shutdown(self) -> None:
+        if self.feishu_channel is not None:
+            self.feishu_channel.stop()
+        self.scheduler.stop()
+
+    def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.scheduler.stop()
+        if self.feishu_channel is not None:
+            self.feishu_channel.stop()
+        config = self.config_store.update(payload)
+        self._ensure_context_files(refresh=True)
+        self.feishu_channel = self._build_feishu_channel()
+        if self.feishu_channel is not None:
+            self.feishu_channel.start(self.handle_feishu_message)
+        self.scheduler.start()
+        return {"config": self.public_config_payload()}
+
+    def chat_complete(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        messages = self._coerce_messages(body)
+        profile_id, session = self._resolve_request_session(body)
+        provider_name = str(body.get("provider", "chat")).strip().lower()
+        provider = self._provider_for_request(provider_name, str(body.get("model", "") or "").strip())
+        response = request_chat_completion(
+            provider,
+            messages,
+            stream=False,
+            temperature=float(body.get("temperature", 0.7)),
+        )
+        content = extract_text_content(response)
+        self._append_messages_to_session(session.session_id, profile_id, messages, content, channel=str(body.get("channel", "web") or "web"))
+        self._record_event(
+            "chat_complete",
+            {"provider": provider_name, "messages": messages, "response": content[:2000]},
+            profile_id=profile_id,
+            session_id=session.session_id,
+            channel=str(body.get("channel", "web") or "web"),
+        )
+        self._refresh_active_memory()
+        return {"content": content, "raw": response, "profile_id": profile_id, "session_id": session.session_id}
+
+    def chat_respond(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        messages = self._coerce_messages(body)
+        profile_id, session = self._resolve_request_session(body)
+        attachments = body.get("attachments") or []
+        search_query = str(body.get("search_query", "") or "").strip()
+        tool_contexts = self._prepare_tool_contexts(attachments, search_query)
+        final_messages = self._build_main_chat_messages(messages, tool_contexts, session.session_id)
+        response = request_chat_completion(
+            self.config_store.config.chat_api,
+            final_messages,
+            stream=False,
+            temperature=float(body.get("temperature", 0.7)),
+        )
+        content = extract_text_content(response)
+        self._append_messages_to_session(session.session_id, profile_id, messages, content, channel=str(body.get("channel", "web") or "web"))
+        self._record_event(
+            "chat_respond",
+            {
+                "messages": messages,
+                "attachments": attachments,
+                "tool_contexts": tool_contexts,
+                "response": content[:2000],
+            },
+            profile_id=profile_id,
+            session_id=session.session_id,
+            channel=str(body.get("channel", "web") or "web"),
+        )
+        self._refresh_active_memory()
+        return {
+            "content": content,
+            "tool_contexts": tool_contexts,
+            "raw": response,
+            "profile_id": profile_id,
+            "session_id": session.session_id,
+        }
+
+    def openai_compatible_chat(self, body: Dict[str, Any], provider_name: str = "chat") -> Dict[str, Any]:
+        messages = body.get("messages") or []
+        if not messages:
+            raise ValueError("messages is required")
+        provider = self._provider_for_request(provider_name, str(body.get("model", "") or "").strip())
+        response = request_chat_completion(
+            provider,
+            messages,
+            stream=False,
+            temperature=float(body.get("temperature", 0.7)),
+        )
+        if isinstance(response, dict) and response.get("choices"):
+            return response
+        content = extract_text_content(response)
+        return {
+            "id": "chatcmpl-saki",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+    def stream_chat_reply(
+        self,
+        *,
+        messages: list[Dict[str, str]],
+        profile_id: str = "local-user",
+        session_id: str = "",
+        channel: str = "web",
+        attachments: Optional[list[Dict[str, Any]]] = None,
+        search_query: str = "",
+        temperature: float = 0.7,
+        event_type: str = "chat_stream",
+        event_payload: Optional[Dict[str, Any]] = None,
+    ) -> Iterable[str]:
+        if not session_id:
+            _, session = self._resolve_request_session({"profile_id": profile_id, "channel": channel})
+            session_id = session.session_id
+        tool_contexts = self._prepare_tool_contexts(attachments or [], search_query)
+        final_messages = self._build_main_chat_messages(messages, tool_contexts, session_id)
+
+        def generate() -> Iterable[str]:
+            collected: list[str] = []
+            try:
+                for chunk in stream_chat_completion(
+                    self.config_store.config.chat_api,
+                    final_messages,
+                    temperature=temperature,
+                ):
+                    collected.append(chunk)
+                    yield chunk
+            finally:
+                payload = dict(event_payload or {})
+                payload.update(
+                    {
+                        "messages": messages,
+                        "tool_contexts": tool_contexts,
+                        "response": "".join(collected)[:2000],
+                    }
+                )
+                self._append_messages_to_session(session_id, profile_id, messages, "".join(collected), channel=channel)
+                self._record_event(event_type, payload, profile_id=profile_id, session_id=session_id, channel=channel)
+                self._refresh_active_memory()
+
+        return generate()
+
+    def handle_feishu_message(self, inbound: Dict[str, Any]) -> Iterable[str]:
+        prompt = str(inbound.get("text", "") or "").strip()
+        messages = [{"role": "user", "content": prompt}] if prompt else []
+        if not messages:
+            return []
+        profile_id = self._profile_id_for_inbound(inbound)
+        _, session = self._resolve_request_session(
+            {
+                "profile_id": profile_id,
+                "channel": "feishu",
+                "channel_user_id": inbound.get("open_id", ""),
+                "chat_id": inbound.get("chat_id", ""),
+                "thread_id": inbound.get("thread_id", ""),
+            }
+        )
+        return self.stream_chat_reply(
+            messages=messages,
+            profile_id=profile_id,
+            session_id=session.session_id,
+            channel="feishu",
+            temperature=0.7,
+            event_type="feishu_chat_respond",
+            event_payload={
+                "channel": "feishu",
+                "open_id": inbound.get("open_id", ""),
+                "chat_id": inbound.get("chat_id", ""),
+                "chat_type": inbound.get("chat_type", ""),
+                "message_id": inbound.get("message_id", ""),
+            },
+        )
+
+    def _build_feishu_channel(self):
+        channels = self.config_store.config.channels
+        if not channels.feishu_enabled:
+            return None
+        if not channels.feishu_app_id or not channels.feishu_app_secret:
+            return None
+        from .channels.feishu import FeishuChannel, FeishuChannelConfig
+
+        return FeishuChannel(
+            FeishuChannelConfig(
+                app_id=channels.feishu_app_id,
+                app_secret=channels.feishu_app_secret,
+                enabled=channels.feishu_enabled,
+                auto_reconnect=channels.feishu_auto_reconnect,
+                debug=channels.feishu_debug,
+                card_title=channels.feishu_card_title,
+                patch_interval_ms=channels.feishu_patch_interval_ms,
+                patch_min_chars=channels.feishu_patch_min_chars,
+            )
+        )
+
+    def _provider_for_request(self, provider_name: str, model_override: str = "") -> Any:
+        provider = self._select_provider(provider_name)
+        if model_override and getattr(provider, "model", "") != model_override:
+            provider = copy.deepcopy(provider)
+            provider.model = model_override
+        return provider
+
+    def _select_provider(self, provider_name: str) -> Any:
+        provider_name = provider_name.lower().strip()
+        if provider_name == "search":
+            return self.config_store.config.search_api
+        if provider_name == "action":
+            return self.config_store.config.action_api
+        return self.config_store.config.chat_api
+
+    def _coerce_messages(self, body: Dict[str, Any]) -> list[Dict[str, str]]:
+        messages = body.get("messages") or []
+        prompt = str(body.get("prompt", "") or "").strip()
+        if prompt and not messages:
+            messages = [{"role": "user", "content": prompt}]
+        if not messages:
+            raise ValueError("messages or prompt is required")
+        return messages
+
+    def _build_main_chat_messages(
+        self,
+        messages: list[Dict[str, str]],
+        tool_contexts: list[Dict[str, Any]],
+        session_id: str = "",
+    ) -> list[Dict[str, str]]:
+        config = self.config_store.config
+        system_parts = [
+            f"你是用户的 {config.persona.partner_role}，名字是 {config.persona.partner_name}。",
+            f"说话风格：{config.persona.core_identity}",
+            f"边界要求：{config.persona.boundaries}",
+            "你是唯一直接对用户说话的模型。工具层、搜索层、识图层都只能给你补充上下文，不能替你发言。",
+        ]
+        core_profile = self._read_text_file(self._core_memory_file())
+        active_memory = self._read_text_file(self._active_memory_file())
+        if core_profile:
+            system_parts.append("以下是核心档案，请将其视为稳定关系背景。\n\n" + core_profile)
+        if active_memory:
+            system_parts.append("以下是近期活跃记忆，请在相关时自然接住。\n\n" + active_memory)
+        if tool_contexts:
+            context_lines = []
+            for index, item in enumerate(tool_contexts, start=1):
+                context_lines.append(
+                    f"[{index}] 类型: {item.get('type', 'unknown')}\n链接: {item.get('url', '')}\n用户备注: {item.get('note', '') or '无'}\n工具整理上下文: {item.get('context', '')}"
+                )
+            system_parts.append(
+                "以下是工具层提供的附加上下文。仅在相关时自然吸收，不要生硬复述，也不要提及这是工具、抓取或系统注入的内容。\n\n"
+                + "\n\n".join(context_lines)
+            )
+        recent_messages = []
+        if session_id:
+            recent_messages = self.runtime_store.list_recent_messages(
+                session_id,
+                limit=self.config_store.config.session.recent_message_limit,
+            )
+        if len(messages) > 1:
+            recent_messages = []
+        return [{"role": "system", "content": "\n".join(system_parts)}] + recent_messages + messages
+
+    def _prepare_tool_contexts(self, attachments: list[Dict[str, Any]], search_query: str) -> list[Dict[str, Any]]:
+        tool_contexts = []
+        if search_query:
+            tool_contexts.append(prepare_search_context(self.config_store.config, search_query))
+        for attachment in attachments:
+            attachment_type = str(attachment.get("type", "") or "").strip().lower()
+            if attachment_type in {"url", "link", "shared_link"}:
+                url = str(attachment.get("url", "") or "").strip()
+                note = str(attachment.get("note", "") or "").strip()
+                if url:
+                    tool_contexts.append(prepare_shared_link_context(self.config_store.config, url, note))
+            if attachment_type in {"image", "image_url", "photo"}:
+                image_url = str(attachment.get("url", "") or attachment.get("image_url", "") or "").strip()
+                note = str(attachment.get("note", "") or "").strip()
+                if image_url:
+                    tool_contexts.append(prepare_image_context(self.config_store.config, image_url, note, self.root))
+            if attachment_type in {"search", "web_search"}:
+                query = str(attachment.get("query", "") or attachment.get("text", "") or "").strip()
+                if query:
+                    tool_contexts.append(prepare_search_context(self.config_store.config, query))
+        return tool_contexts
+
+    def list_memories_grouped(self, category: str = "") -> Dict[str, Any]:
+        records = [self._serialize_memory(record) for record in self.memory_store.list_memories(limit=1000)]
+        if category:
+            items = [item for item in records if item["category"] == category]
+            return {"category": category, "items": items}
+        grouped: Dict[str, Any] = {
+            name: [] for name in ["anniversary", "preference", "promise", "story", "other", "password", "travel"]
+        }
+        for item in records:
+            grouped.setdefault(item["category"], []).append(item)
+        grouped["items"] = records
+        grouped["stats"] = {key: len(value) for key, value in grouped.items() if isinstance(value, list) and key != "items"}
+        return grouped
+
+    def search_memories_payload(self, query: str) -> Dict[str, Any]:
+        items = [self._serialize_memory(record) for record in self.memory_store.search(query)] if query else []
+        return {"query": query, "items": items, "results": items}
+
+    def list_sessions_payload(self, profile_id: str = "") -> Dict[str, Any]:
+        sessions = self.runtime_store.list_sessions(profile_id=profile_id, limit=50)
+        return {
+            "profile_id": profile_id,
+            "items": [session.__dict__ for session in sessions],
+        }
+
+    def list_events_payload(self, profile_id: str = "", session_id: str = "", limit: int = 50) -> Dict[str, Any]:
+        return {
+            "profile_id": profile_id,
+            "session_id": session_id,
+            "items": self.runtime_store.list_events(profile_id=profile_id, session_id=session_id, limit=limit),
+        }
+
+    def list_reminders_payload(self, profile_id: str = "", status: str = "") -> Dict[str, Any]:
+        items = [self._serialize_reminder(record) for record in self.runtime_store.list_reminders(profile_id=profile_id, status=status)]
+        return {"profile_id": profile_id, "status": status, "items": items}
+
+    def create_reminder_payload(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        profile_id = str(body.get("profile_id", "local-user") or "local-user").strip()
+        content = str(body.get("content", "") or body.get("reason", "")).strip()
+        if not content:
+            raise ValueError("content is required")
+        trigger_at = str(body.get("trigger_at", "") or "").strip()
+        if not trigger_at:
+            minutes = int(body.get("minutes", 0) or 0)
+            if minutes <= 0:
+                raise ValueError("trigger_at or minutes is required")
+            trigger_at = datetime.utcfromtimestamp(datetime.utcnow().timestamp() + minutes * 60).isoformat()
+        reminder = self.runtime_store.create_reminder(
+            reminder_id=f"rem_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}",
+            profile_id=profile_id,
+            content=content,
+            trigger_at=trigger_at,
+            channel=str(body.get("channel", "") or "").strip(),
+            metadata=body.get("metadata") or {},
+        )
+        self._record_event(
+            "reminder_created",
+            {"content": content, "trigger_at": trigger_at, "metadata": reminder.metadata},
+            profile_id=profile_id,
+        )
+        return {"item": self._serialize_reminder(reminder)}
+
+    def delete_reminder_payload(self, reminder_id: str) -> Dict[str, Any]:
+        reminder = self.runtime_store.get_reminder(reminder_id)
+        deleted = self.runtime_store.delete_reminder(reminder_id)
+        if not deleted:
+            raise KeyError("reminder not found")
+        self._record_event("reminder_deleted", {"reminder_id": reminder_id}, profile_id=reminder.profile_id)
+        return {"success": True, "deleted": self._serialize_reminder(reminder)}
+
+    def list_mcp_servers_payload(self) -> Dict[str, Any]:
+        bridge_tools = []
+        for item in self.tools.list_enabled():
+            if item["id"] == "call_mcp":
+                bridge_tools.append(item)
+        return {
+            "servers": self.tools.execute("call_mcp", {"server": "", "tool": ""}) if False else [],
+            "gateway_tools": bridge_tools,
+            "configured_servers": [
+                {
+                    "name": server.name,
+                    "enabled": server.enabled,
+                    "command": server.command,
+                    "args": server.args,
+                }
+                for server in self.config_store.config.mcp_servers
+            ],
+        }
+
+    def dispatch_proactive_message(self, profile_id: str, content: str, source: str = "proactive") -> Dict[str, Any]:
+        profile = self.runtime_store.profile_state(profile_id)
+        channel = str(profile.get("last_channel", "") or "")
+        delivered = False
+        note = ""
+        if channel == "feishu" and self.feishu_channel is not None:
+            open_id = str(profile.get("channel_user_id", "") or "")
+            chat_id = str(profile.get("chat_id", "") or "")
+            chat_type = "p2p" if not chat_id else "group"
+            self.feishu_channel.send_text(open_id, content, chat_id=chat_id, chat_type=chat_type)
+            delivered = True
+        else:
+            note = "no live outbound channel was available; event recorded only"
+        self._record_event(
+            source,
+            {"content": content, "delivered": delivered, "note": note},
+            profile_id=profile_id,
+            session_id=str(profile.get("last_session_id", "") or ""),
+            channel=channel,
+        )
+        return {"profile_id": profile_id, "content": content, "delivered": delivered, "note": note, "channel": channel}
+
+    def upsert_panel_memory(self, body: Dict[str, Any], memory_id: str = "") -> Dict[str, Any]:
+        raw_id = memory_id or str(body.get("id", "") or "") or f"mem_{len(self.memory_store.list_memories(1000)) + 1}"
+        title = str(body.get("title", "") or body.get("key", "") or "untitled")
+        record = self.memory_store.upsert_memory(
+            memory_id=raw_id,
+            key=title,
+            content=str(body.get("content", "") or ""),
+            category=str(body.get("category", "other") or "other"),
+            importance=float(body.get("importance", 0.5) or 0.5),
+            session_id=str(body.get("session_id", "") or ""),
+            embedding=body.get("embedding") or [],
+        )
+        self._ensure_context_files(refresh=True)
+        return {"item": self._serialize_memory(record)}
+
+    def delete_panel_memory(self, memory_id: str) -> Dict[str, Any]:
+        existing = self.memory_store.get_memory(memory_id)
+        if existing is None:
+            raise KeyError("memory not found")
+        self.memory_store.delete_memory(memory_id)
+        self._ensure_context_files(refresh=True)
+        return {"success": True, "deleted": self._serialize_memory(existing), "category": existing.category}
+
+    def get_context_payload(self) -> Dict[str, Any]:
+        return {
+            "core_profile": self._read_text_file(self._core_memory_file()),
+            "active_memory": self._read_text_file(self._active_memory_file()),
+        }
+
+    def _resolve_request_session(self, body: Dict[str, Any]) -> tuple[str, Any]:
+        profile_id = str(body.get("profile_id", "local-user") or "local-user").strip()
+        session = self.runtime_store.resolve_session(
+            profile_id=profile_id,
+            channel=str(body.get("channel", "web") or "web").strip(),
+            channel_user_id=str(body.get("channel_user_id", "") or "").strip(),
+            chat_id=str(body.get("chat_id", "") or "").strip(),
+            thread_id=str(body.get("thread_id", "") or "").strip(),
+            idle_rotation_minutes=self.config_store.config.session.idle_rotation_minutes,
+        )
+        return profile_id, session
+
+    def _append_messages_to_session(
+        self,
+        session_id: str,
+        profile_id: str,
+        messages: list[Dict[str, str]],
+        response: str,
+        *,
+        channel: str,
+    ) -> None:
+        for message in messages:
+            role = str(message.get("role", "") or "").strip()
+            content = str(message.get("content", "") or "").strip()
+            if role in {"user", "assistant"} and content:
+                self.runtime_store.append_message(
+                    session_id=session_id,
+                    profile_id=profile_id,
+                    role=role,
+                    content=content,
+                    channel=channel,
+                )
+        if response.strip():
+            self.runtime_store.append_message(
+                session_id=session_id,
+                profile_id=profile_id,
+                role="assistant",
+                content=response.strip(),
+                channel=channel,
+            )
+
+    def _record_event(
+        self,
+        event_type: str,
+        payload: Dict[str, Any],
+        *,
+        profile_id: str = "",
+        session_id: str = "",
+        channel: str = "",
+    ) -> None:
+        self.memory_store.add_event(event_type, payload)
+        self.runtime_store.add_event(event_type, payload, profile_id=profile_id, session_id=session_id, channel=channel)
+
+    def _serialize_reminder(self, record: Any) -> Dict[str, Any]:
+        return {
+            "id": record.reminder_id,
+            "profile_id": record.profile_id,
+            "content": record.content,
+            "trigger_at": record.trigger_at,
+            "status": record.status,
+            "channel": record.channel,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "delivered_at": record.delivered_at,
+            "metadata": record.metadata,
+        }
+
+    def _deliver_due_reminder(self, reminder_id: str) -> None:
+        reminder = self.runtime_store.get_reminder(reminder_id)
+        result = self.dispatch_proactive_message(reminder.profile_id, reminder.content, "scheduled_reminder")
+        if result.get("delivered"):
+            self.runtime_store.mark_reminder_delivered(reminder_id)
+        self._refresh_active_memory()
+
+    def _send_idle_proactive_ping(self, profile_id: str) -> None:
+        persona = self.config_store.config.persona
+        content = f"{persona.call_user}，我刚刚想起你了。最近还好吗？如果你愿意，也可以和我说说今天发生了什么。"
+        self.dispatch_proactive_message(profile_id, content, "idle_proactive_ping")
+        self.runtime_store.mark_proactive_sent(profile_id)
+        self._refresh_active_memory()
+
+    def _profile_id_for_inbound(self, inbound: Dict[str, Any]) -> str:
+        open_id = str(inbound.get("open_id", "") or "").strip()
+        if open_id:
+            return f"feishu:{open_id}"
+        chat_id = str(inbound.get("chat_id", "") or "").strip()
+        if chat_id:
+            return f"feishu-chat:{chat_id}"
+        return "feishu:anonymous"
+
+    def resolve_static_path(self, request_path: str) -> Optional[Path]:
+        if self.dashboard_root is None:
+            return None
+        relative = request_path.lstrip("/") or "index.html"
+        candidate = (self.dashboard_root / relative).resolve()
+        if not str(candidate).startswith(str(self.dashboard_root.resolve())):
+            return None
+        if candidate.is_dir():
+            candidate = candidate / "index.html"
+        if candidate.exists() and candidate.is_file():
+            return candidate
+        if "." not in relative:
+            fallback = (self.dashboard_root / "index.html").resolve()
+            if fallback.exists():
+                return fallback
+        return None
+
+    def _serialize_memory(self, record: Any) -> Dict[str, Any]:
+        return {
+            "id": record.id,
+            "title": record.key,
+            "key": record.key,
+            "content": record.content,
+            "category": record.category,
+            "importance": record.importance,
+            "createdAt": record.created_at,
+            "updatedAt": record.updated_at,
+            "date": record.created_at[:10] if record.created_at else "",
+            "source": "gateway",
+            "session_id": record.session_id,
+            "final_score": getattr(record, "final_score", 0.0),
+        }
+
+    def _find_dashboard_root(self) -> Optional[Path]:
+        candidates = [
+            self.root.parent / "saki-phone" / "web",
+            self.root.parent / "saki-phone",
+        ]
+        for candidate in candidates:
+            if (candidate / "index.html").exists():
+                return candidate.resolve()
+        return None
+
+    def _ensure_context_files(self, refresh: bool = False) -> None:
+        core_file = self._core_memory_file()
+        active_file = self._active_memory_file()
+        core_file.parent.mkdir(parents=True, exist_ok=True)
+        active_file.parent.mkdir(parents=True, exist_ok=True)
+        if refresh or not core_file.exists():
+            self._write_text_file(core_file, self._render_core_profile())
+        if refresh or not active_file.exists():
+            self._write_text_file(active_file, self._render_active_memory())
+
+    def _core_memory_file(self) -> Path:
+        return self.root / self.config_store.config.memory.core_memory_path.replace("./", "")
+
+    def _active_memory_file(self) -> Path:
+        return self.root / self.config_store.config.memory.hot_memory_path.replace("./", "")
+
+    def _render_core_profile(self) -> str:
+        persona = self.config_store.config.persona
+        lines = [
+            f"更新时间: {datetime.utcnow().isoformat()}",
+            f"伴侣名字: {persona.partner_name}",
+            f"伴侣身份: {persona.partner_role}",
+            f"对用户称呼: {persona.call_user}",
+            f"核心气质: {persona.core_identity}",
+            f"互动边界: {persona.boundaries}",
+        ]
+        important_categories = {"preference", "promise", "anniversary"}
+        important_memories = [
+            item for item in self.list_memories_grouped().get("items", []) if item.get("category") in important_categories
+        ][:8]
+        if important_memories:
+            lines.append("")
+            lines.append("关键长期记忆:")
+            for item in important_memories:
+                lines.append(f"- [{item.get('category', 'other')}] {item.get('title', '')}: {item.get('content', '')[:140]}")
+        return "\n".join(lines).strip() + "\n"
+
+    def _render_active_memory(self) -> str:
+        lines = [f"更新时间: {datetime.utcnow().isoformat()}"]
+        recent_memories = self.memory_store.list_memories(limit=8)
+        if recent_memories:
+            lines.append("")
+            lines.append("近期记忆:")
+            for record in recent_memories:
+                lines.append(f"- [{record.category}] {record.key}: {record.content[:160]}")
+        recent_events = self.memory_store.list_events(limit=10)
+        if recent_events:
+            lines.append("")
+            lines.append("最近事件:")
+            for event in reversed(recent_events):
+                summary = self._summarize_event(event)
+                if summary:
+                    lines.append(f"- {summary}")
+        return "\n".join(lines).strip() + "\n"
+
+    def _refresh_active_memory(self) -> None:
+        self._write_text_file(self._active_memory_file(), self._render_active_memory())
+
+    def _read_text_file(self, file_path: Path) -> str:
+        if not file_path.exists():
+            return ""
+        return file_path.read_text(encoding="utf-8").strip()
+
+    def _write_text_file(self, file_path: Path, content: str) -> None:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+    def _summarize_event(self, event: Dict[str, Any]) -> str:
+        event_type = event.get("event_type", "event")
+        payload = event.get("payload") or {}
+        response = str(payload.get("response", "") or "").strip()
+        prompt = ""
+        messages = payload.get("messages") or []
+        if messages:
+            prompt = str(messages[-1].get("content", "") or "").strip()
+        if event_type == "tool_execute":
+            return f"工具调用: {payload.get('tool', '')}"
+        if prompt and response:
+            return f"{event_type}: 用户说“{prompt[:60]}”，系统回复“{response[:80]}”"
+        if prompt:
+            return f"{event_type}: 用户说“{prompt[:80]}”"
+        if response:
+            return f"{event_type}: 系统回复“{response[:100]}”"
+        return f"{event_type}: {json.dumps(payload, ensure_ascii=False)[:120]}"
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    app: Optional[GatewayApp] = None
+    protocol_version = "HTTP/1.1"
+
+    def _app(self) -> GatewayApp:
+        if self.app is None:
+            raise RuntimeError("gateway app is not bound")
+        return self.app
+
+    def _auth_required(self) -> bool:
+        return bool(self._app().config_store.config.dashboard_security.enabled)
+
+    def _check_auth(self) -> bool:
+        if not self._auth_required():
+            return True
+        expected_password = str(self._app().config_store.config.dashboard_security.password or "")
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Basic "):
+            return False
+        token = auth[6:].strip()
+        try:
+            decoded = base64.b64decode(token).decode("utf-8")
+        except Exception:
+            return False
+        _, _, password = decoded.partition(":")
+        if expected_password.startswith("sha256:"):
+            return normalize_dashboard_password(password) == expected_password
+        return password == expected_password
+
+    def _require_auth(self) -> bool:
+        if self._check_auth():
+            return True
+        payload = json.dumps({"error": "authentication required"}, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("WWW-Authenticate", 'Basic realm="Saki Dashboard"')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+        return False
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Saki-Provider")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        try:
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            app = self._app()
+            if parsed.path == "/health":
+                self._json(HTTPStatus.OK, {"ok": True, "state": app.state()})
+                return
+            if parsed.path == "/api/config":
+                self._json(HTTPStatus.OK, app.public_config_payload())
+                return
+            if parsed.path == "/api/tools":
+                self._json(HTTPStatus.OK, {"tools": app.tools.list_enabled()})
+                return
+            if parsed.path == "/api/memories/stats":
+                grouped = app.list_memories_grouped()
+                self._json(HTTPStatus.OK, {"stats": grouped.get("stats", {})})
+                return
+            if parsed.path == "/api/memories":
+                category = parse_qs(parsed.query).get("category", [""])[0]
+                self._json(HTTPStatus.OK, app.list_memories_grouped(category))
+                return
+            if parsed.path == "/api/sessions":
+                profile_id = parse_qs(parsed.query).get("profile_id", [""])[0]
+                self._json(HTTPStatus.OK, app.list_sessions_payload(profile_id))
+                return
+            if parsed.path == "/api/events":
+                query = parse_qs(parsed.query)
+                profile_id = query.get("profile_id", [""])[0]
+                session_id = query.get("session_id", [""])[0]
+                limit = int(query.get("limit", ["50"])[0] or "50")
+                self._json(HTTPStatus.OK, app.list_events_payload(profile_id, session_id, limit))
+                return
+            if parsed.path == "/api/reminders":
+                query = parse_qs(parsed.query)
+                profile_id = query.get("profile_id", [""])[0]
+                status = query.get("status", [""])[0]
+                self._json(HTTPStatus.OK, app.list_reminders_payload(profile_id, status))
+                return
+            if parsed.path == "/api/memories/search":
+                query = parse_qs(parsed.query).get("q", [""])[0]
+                self._json(HTTPStatus.OK, app.search_memories_payload(query))
+                return
+            if parsed.path == "/api/context":
+                self._json(HTTPStatus.OK, app.get_context_payload())
+                return
+            static_path = app.resolve_static_path(parsed.path)
+            if static_path is not None:
+                self._serve_static(static_path)
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except Exception as error:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+
+    def do_POST(self) -> None:
+        try:
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            app = self._app()
+            body = self._read_json()
+            if parsed.path == "/api/config":
+                self._json(HTTPStatus.OK, app.update_config(body))
+                return
+            if parsed.path == "/api/memories":
+                self._json(HTTPStatus.CREATED, app.upsert_panel_memory(body))
+                return
+            if parsed.path == "/api/reminders":
+                self._json(HTTPStatus.CREATED, app.create_reminder_payload(body))
+                return
+            if parsed.path == "/api/tools/execute":
+                tool_id = str(body.get("tool", ""))
+                payload = body.get("input") or {}
+                try:
+                    result = app.tools.execute(tool_id, payload)
+                except Exception as error:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                app._record_event(
+                    "tool_execute",
+                    {"tool": tool_id, "input": payload, "result": result},
+                    profile_id=str(payload.get("profile_id", "") or ""),
+                )
+                self._json(HTTPStatus.OK, {"result": result})
+                return
+            if parsed.path == "/api/chat/complete":
+                self._json(HTTPStatus.OK, app.chat_complete(body))
+                return
+            if parsed.path == "/api/chat/respond":
+                self._json(HTTPStatus.OK, app.chat_respond(body))
+                return
+            if parsed.path == "/api/v1/chat/completions":
+                provider_name = self.headers.get("X-Saki-Provider", "chat")
+                self._json(HTTPStatus.OK, app.openai_compatible_chat(body, provider_name))
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except Exception as error:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+
+    def do_HEAD(self) -> None:
+        try:
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            static_path = self._app().resolve_static_path(parsed.path)
+            if static_path is None:
+                self.send_response(HTTPStatus.NOT_FOUND)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data_length = static_path.stat().st_size
+            mime_type, _ = mimetypes.guess_type(str(static_path))
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime_type or "application/octet-stream")
+            self.send_header("Content-Length", str(data_length))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except Exception:
+            self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def do_PUT(self) -> None:
+        try:
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            app = self._app()
+            body = self._read_json()
+            if parsed.path.startswith("/api/memories/"):
+                memory_id = parsed.path.rsplit("/", 1)[-1]
+                self._json(HTTPStatus.OK, app.upsert_panel_memory(body, memory_id))
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except Exception as error:
+            if isinstance(error, KeyError):
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+
+    def do_DELETE(self) -> None:
+        try:
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            app = self._app()
+            if parsed.path.startswith("/api/memories/"):
+                memory_id = parsed.path.rsplit("/", 1)[-1]
+                self._json(HTTPStatus.OK, app.delete_panel_memory(memory_id))
+                return
+            if parsed.path.startswith("/api/reminders/"):
+                reminder_id = parsed.path.rsplit("/", 1)[-1]
+                self._json(HTTPStatus.OK, app.delete_reminder_payload(reminder_id))
+                return
+            self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except Exception as error:
+            if isinstance(error, KeyError):
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+
+    def log_message(self, format: str, *args: Any) -> None:
+        sys.stderr.write("[gateway] " + format % args + "\n")
+
+    def _read_json(self) -> Dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+        return json.loads(raw or "{}")
+
+    def _json(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
+        data = json.dumps(payload, ensure_ascii=False, default=_json_default).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_static(self, file_path: Path) -> None:
+        data = file_path.read_bytes()
+        mime_type, _ = mimetypes.guess_type(str(file_path))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", mime_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "__dict__"):
+        return value.__dict__
+    raise TypeError(f"Object of type {type(value)!r} is not JSON serializable")
+
+
+def create_server(app: GatewayApp) -> ThreadingHTTPServer:
+
+    class BoundHandler(RequestHandler):
+        pass
+
+    BoundHandler.app = app
+    return ThreadingHTTPServer((app.config_store.config.host, app.config_store.config.port), BoundHandler)
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parents[2]
+    app = GatewayApp(root)
+    server = create_server(app)
+    print(f"saki-gateway listening on http://{server.server_address[0]}:{server.server_address[1]}")
+    try:
+        app.start_channels()
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.shutdown()
+        server.server_close()
