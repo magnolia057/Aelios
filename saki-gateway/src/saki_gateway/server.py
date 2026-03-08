@@ -667,10 +667,13 @@ class GatewayApp:
         session_id: str = "",
     ) -> list[Dict[str, Any]]:
         config = self.config_store.config
+        local_now = datetime.now().astimezone()
         system_parts = [
             f"你是用户的 {config.persona.partner_role}，名字是 {config.persona.partner_name}。",
             f"说话风格：{config.persona.core_identity}",
             f"边界要求：{config.persona.boundaries}",
+            f"（参考信息）当前服务器本地时间：{local_now.isoformat(timespec='seconds')}。请以这个本地时间判断现在是白天、夜晚、工作日还是周末。",
+            "如果用户提到绝对时间但没有注明时区或 UTC 偏移，请按服务器本地时间理解。",
             "你是唯一直接对用户说话的模型。工具层、搜索层、识图层都只能给你补充上下文，不能替你发言。",
             "默认先用工具层/行动层完成搜索、读链接、识图、记忆检索和提醒创建；只有工具失败、未配置，或纯陪伴聊天不需要工具时，才由你直接兜底回答。",
         ]
@@ -1118,7 +1121,7 @@ class GatewayApp:
     def _render_core_profile(self) -> str:
         persona = self.config_store.config.persona
         lines = [
-            f"更新时间: {datetime.utcnow().isoformat()}",
+            f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"伴侣名字: {persona.partner_name}",
             f"伴侣身份: {persona.partner_role}",
             f"对用户称呼: {persona.call_user}",
@@ -1137,7 +1140,7 @@ class GatewayApp:
         return "\n".join(lines).strip() + "\n"
 
     def _render_active_memory(self) -> str:
-        lines = [f"更新时间: {datetime.utcnow().isoformat()}"]
+        lines = [f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
         recent_memories = self.memory_store.list_memories(limit=8)
         if recent_memories:
             lines.append("")
