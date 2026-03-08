@@ -471,19 +471,11 @@ class FeishuChannel:
 
     def _build_card(self, content: str, *, loading: bool) -> dict[str, Any]:
         safe_text = self._truncate_card_text(content)
-        header_template = "wathet" if loading else "blue"
-        status_line = "思考中" if loading else "回复中"
+        status_line = "正在整理回复" if loading else "最新回复"
         return {
             "config": {
                 "wide_screen_mode": True,
                 "enable_forward": True,
-            },
-            "header": {
-                "title": {
-                    "tag": "plain_text",
-                    "content": self.config.card_title,
-                },
-                "template": header_template,
             },
             "elements": [
                 {

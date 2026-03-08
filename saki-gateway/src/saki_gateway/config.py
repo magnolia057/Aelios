@@ -75,9 +75,11 @@ class ChannelConfig:
     web_enabled: bool = True
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
+    napcat_base_url: str = "http://127.0.0.1:3000"
+    napcat_access_token: str = ""
     feishu_auto_reconnect: bool = True
     feishu_debug: bool = False
-    feishu_card_title: str = "Saki"
+    feishu_card_title: str = "AI 伴侣"
     feishu_patch_interval_ms: int = 450
     feishu_patch_min_chars: int = 24
 
@@ -166,6 +168,9 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
     config.channels.feishu_enabled = _env_flag("SAKI_FEISHU_ENABLED", config.channels.feishu_enabled)
     config.channels.feishu_app_id = os.getenv("SAKI_FEISHU_APP_ID", config.channels.feishu_app_id)
     config.channels.feishu_app_secret = os.getenv("SAKI_FEISHU_APP_SECRET", config.channels.feishu_app_secret)
+    config.channels.napcat_enabled = _env_flag("SAKI_NAPCAT_ENABLED", config.channels.napcat_enabled)
+    config.channels.napcat_base_url = os.getenv("SAKI_NAPCAT_BASE_URL", config.channels.napcat_base_url)
+    config.channels.napcat_access_token = os.getenv("SAKI_NAPCAT_ACCESS_TOKEN", config.channels.napcat_access_token)
     config.dashboard_security.enabled = _env_flag("SAKI_DASHBOARD_AUTH_ENABLED", config.dashboard_security.enabled)
     config.dashboard_security.password = normalize_dashboard_password(
         os.getenv("SAKI_DASHBOARD_PASSWORD", config.dashboard_security.password)

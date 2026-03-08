@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Optional
 
 
 def build_chat_completion_payload(
@@ -13,17 +14,23 @@ def build_chat_completion_payload(
     *,
     stream: bool = False,
     temperature: float = 0.7,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: str = "auto",
 ) -> Dict[str, Any]:
     if not model:
         raise ValueError("model is required")
     if not messages:
         raise ValueError("messages are required")
-    return {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": stream,
         "temperature": temperature,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = tool_choice
+    return payload
 
 
 def request_chat_completion(
@@ -33,6 +40,8 @@ def request_chat_completion(
     stream: bool = False,
     temperature: float = 0.7,
     timeout: int = 45,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: str = "auto",
 ) -> Dict[str, Any]:
     provider_name = getattr(provider, "label", None) or getattr(provider, "backend_type", None) or "unknown"
     if not getattr(provider, "enabled", False):
@@ -49,9 +58,17 @@ def request_chat_completion(
         provider.model,
         stream=stream and bool(getattr(provider, "stream", False)),
         temperature=temperature,
+        tools=tools,
+        tool_choice=tool_choice,
     )
+    base_url = str(getattr(provider, "base_url", "") or "").rstrip("/")
+    parsed = urllib.parse.urlparse(base_url)
+    request_url = base_url
+    if not parsed.path.endswith("/chat/completions"):
+        request_url = base_url + "/chat/completions"
+
     request = urllib.request.Request(
-        provider.base_url.rstrip("/") + "/chat/completions",
+        request_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -111,8 +128,14 @@ def stream_chat_completion(
         return
 
     payload = build_chat_completion_payload(messages, provider.model, stream=True, temperature=temperature)
+    base_url = str(getattr(provider, "base_url", "") or "").rstrip("/")
+    parsed = urllib.parse.urlparse(base_url)
+    request_url = base_url
+    if not parsed.path.endswith("/chat/completions"):
+        request_url = base_url + "/chat/completions"
+
     request = urllib.request.Request(
-        provider.base_url.rstrip("/") + "/chat/completions",
+        request_url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -187,3 +210,44 @@ def extract_text_content(response: Dict[str, Any]) -> str:
                 parts.append(str(item.get("text", "")))
         return "\n".join(part for part in parts if part)
     return str(content)
+
+
+def extract_tool_calls(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    choices = response.get("choices") or []
+    if not choices:
+        return []
+    message = choices[0].get("message") or {}
+    tool_calls = message.get("tool_calls") or []
+    normalized: List[Dict[str, Any]] = []
+    for item in tool_calls:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") or {}
+        normalized.append(
+            {
+                "id": str(item.get("id", "") or ""),
+                "type": str(item.get("type", "function") or "function"),
+                "name": str(function.get("name", "") or ""),
+                "arguments": str(function.get("arguments", "") or "{}"),
+            }
+        )
+    if normalized:
+        return normalized
+    legacy_call = message.get("function_call") or {}
+    if isinstance(legacy_call, dict) and legacy_call.get("name"):
+        normalized.append(
+            {
+                "id": "legacy_function_call",
+                "type": "function",
+                "name": str(legacy_call.get("name", "") or ""),
+                "arguments": str(legacy_call.get("arguments", "") or "{}"),
+            }
+        )
+    return normalized
+
+
+def extract_finish_reason(response: Dict[str, Any]) -> str:
+    choices = response.get("choices") or []
+    if not choices:
+        return ""
+    return str(choices[0].get("finish_reason", "") or "")

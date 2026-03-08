@@ -4,6 +4,7 @@ import base64
 import copy
 import json
 import mimetypes
+import re
 import sys
 from dataclasses import asdict
 from datetime import datetime
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import ConfigStore, default_config_path
 from .config import normalize_dashboard_password
 from .llm import extract_text_content, request_chat_completion, stream_chat_completion
+from .llm import extract_finish_reason, extract_tool_calls
 from .memory import MemoryStore
 from .runtime_store import RuntimeStore
 from .scheduler import GatewayScheduler
@@ -50,6 +52,7 @@ class GatewayApp:
         )
         self._ensure_context_files(refresh=True)
         self.feishu_channel = self._build_feishu_channel()
+        self.napcat_channel = self._build_napcat_channel()
         self.scheduler = GatewayScheduler(
             self.runtime_store,
             lambda: self.config_store.config.scheduler,
@@ -69,6 +72,7 @@ class GatewayApp:
             "runtime": self.runtime_store.stats(),
             "channels": {
                 "feishu": self.feishu_channel.status() if self.feishu_channel else {"enabled": False, "ready": False},
+                "qq": self.napcat_channel.status() if self.napcat_channel else {"enabled": False, "ready": False},
             },
             "scheduler": self.scheduler.status(),
             "dashboard": {
@@ -92,22 +96,31 @@ class GatewayApp:
     def start_channels(self) -> None:
         if self.feishu_channel is not None:
             self.feishu_channel.start(self.handle_feishu_message)
+        if self.napcat_channel is not None:
+            self.napcat_channel.start(self.handle_napcat_message)
         self.scheduler.start()
 
     def shutdown(self) -> None:
         if self.feishu_channel is not None:
             self.feishu_channel.stop()
+        if self.napcat_channel is not None:
+            self.napcat_channel.stop()
         self.scheduler.stop()
 
     def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         self.scheduler.stop()
         if self.feishu_channel is not None:
             self.feishu_channel.stop()
+        if self.napcat_channel is not None:
+            self.napcat_channel.stop()
         config = self.config_store.update(payload)
         self._ensure_context_files(refresh=True)
         self.feishu_channel = self._build_feishu_channel()
+        self.napcat_channel = self._build_napcat_channel()
         if self.feishu_channel is not None:
             self.feishu_channel.start(self.handle_feishu_message)
+        if self.napcat_channel is not None:
+            self.napcat_channel.start(self.handle_napcat_message)
         self.scheduler.start()
         return {"config": self.public_config_payload()}
 
@@ -139,22 +152,22 @@ class GatewayApp:
         profile_id, session = self._resolve_request_session(body)
         attachments = body.get("attachments") or []
         search_query = str(body.get("search_query", "") or "").strip()
-        tool_contexts = self._prepare_tool_contexts(attachments, search_query)
-        final_messages = self._build_main_chat_messages(messages, tool_contexts, session.session_id)
-        response = request_chat_completion(
-            self.config_store.config.chat_api,
-            final_messages,
-            stream=False,
+        tool_contexts = self._prepare_tool_contexts(messages, attachments, search_query)
+        content, response, loop_tool_contexts = self._generate_chat_reply(
+            messages=messages,
+            tool_contexts=tool_contexts,
+            session_id=session.session_id,
             temperature=float(body.get("temperature", 0.7)),
+            profile_id=profile_id,
         )
-        content = extract_text_content(response)
+        all_tool_contexts = tool_contexts + loop_tool_contexts
         self._append_messages_to_session(session.session_id, profile_id, messages, content, channel=str(body.get("channel", "web") or "web"))
         self._record_event(
             "chat_respond",
             {
                 "messages": messages,
                 "attachments": attachments,
-                "tool_contexts": tool_contexts,
+                "tool_contexts": all_tool_contexts,
                 "response": content[:2000],
             },
             profile_id=profile_id,
@@ -164,7 +177,7 @@ class GatewayApp:
         self._refresh_active_memory()
         return {
             "content": content,
-            "tool_contexts": tool_contexts,
+            "tool_contexts": all_tool_contexts,
             "raw": response,
             "profile_id": profile_id,
             "session_id": session.session_id,
@@ -212,25 +225,29 @@ class GatewayApp:
         if not session_id:
             _, session = self._resolve_request_session({"profile_id": profile_id, "channel": channel})
             session_id = session.session_id
-        tool_contexts = self._prepare_tool_contexts(attachments or [], search_query)
-        final_messages = self._build_main_chat_messages(messages, tool_contexts, session_id)
+        tool_contexts = self._prepare_tool_contexts(messages, attachments or [], search_query)
 
         def generate() -> Iterable[str]:
             collected: list[str] = []
+            final_tool_contexts: list[Dict[str, Any]] = list(tool_contexts)
             try:
-                for chunk in stream_chat_completion(
-                    self.config_store.config.chat_api,
-                    final_messages,
+                content, _, loop_tool_contexts = self._generate_chat_reply(
+                    messages=messages,
+                    tool_contexts=tool_contexts,
+                    session_id=session_id,
                     temperature=temperature,
-                ):
-                    collected.append(chunk)
-                    yield chunk
+                    profile_id=profile_id,
+                )
+                final_tool_contexts.extend(loop_tool_contexts)
+                if content:
+                    collected.append(content)
+                    yield content
             finally:
                 payload = dict(event_payload or {})
                 payload.update(
                     {
                         "messages": messages,
-                        "tool_contexts": tool_contexts,
+                        "tool_contexts": final_tool_contexts,
                         "response": "".join(collected)[:2000],
                     }
                 )
@@ -239,6 +256,255 @@ class GatewayApp:
                 self._refresh_active_memory()
 
         return generate()
+
+    def _generate_chat_reply(
+        self,
+        *,
+        messages: list[Dict[str, Any]],
+        tool_contexts: list[Dict[str, Any]],
+        session_id: str,
+        temperature: float,
+        profile_id: str,
+        max_rounds: int = 6,
+    ) -> tuple[str, Dict[str, Any], list[Dict[str, Any]]]:
+        base_messages = self._build_main_chat_messages(messages, tool_contexts, session_id)
+        tool_specs = self._chat_tool_specs(profile_id)
+        loop_tool_contexts: list[Dict[str, Any]] = []
+        last_response: Dict[str, Any] = {}
+        tool_provider = self._preferred_tool_provider()
+        final_messages = self._build_action_runtime_messages(messages, tool_contexts, session_id)
+        for _ in range(max_rounds):
+            response = request_chat_completion(
+                tool_provider,
+                final_messages,
+                stream=False,
+                temperature=temperature,
+                tools=tool_specs,
+                tool_choice="auto" if tool_specs else "none",
+            )
+            last_response = response
+            content = extract_text_content(response).strip()
+            tool_calls = extract_tool_calls(response)
+            finish_reason = extract_finish_reason(response)
+            if not tool_calls:
+                if self._provider_is_chat(tool_provider):
+                    return content, response, loop_tool_contexts
+                synthesized = self._synthesize_companion_reply(
+                    messages=messages,
+                    tool_contexts=tool_contexts + loop_tool_contexts,
+                    session_id=session_id,
+                    temperature=temperature,
+                    fallback_content=content,
+                )
+                return synthesized[0], synthesized[1], loop_tool_contexts
+
+            assistant_message = (response.get("choices") or [{}])[0].get("message") or {}
+            final_messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_message.get("content", content),
+                    "tool_calls": assistant_message.get("tool_calls") or tool_calls,
+                }
+            )
+            for tool_call in tool_calls:
+                tool_name = str(tool_call.get("name", "") or "").strip()
+                raw_arguments = str(tool_call.get("arguments", "") or "{}").strip() or "{}"
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    arguments = {"raw_arguments": raw_arguments}
+                arguments = self._enrich_tool_arguments(tool_name, arguments, profile_id)
+                try:
+                    result = self.tools.execute(tool_name, arguments)
+                except Exception as error:
+                    result = {
+                        "ok": False,
+                        "tool": tool_name,
+                        "error": str(error),
+                    }
+                tool_context = self._tool_result_to_context(tool_name, arguments, result)
+                if tool_context is not None:
+                    loop_tool_contexts.append(tool_context)
+                final_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(tool_call.get("id", "") or tool_name),
+                        "name": tool_name,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
+            if finish_reason != "tool_calls" and content:
+                if self._provider_is_chat(tool_provider):
+                    return content, response, loop_tool_contexts
+                synthesized = self._synthesize_companion_reply(
+                    messages=messages,
+                    tool_contexts=tool_contexts + loop_tool_contexts,
+                    session_id=session_id,
+                    temperature=temperature,
+                    fallback_content=content,
+                )
+                return synthesized[0], synthesized[1], loop_tool_contexts
+        raise ValueError("tool calling exceeded maximum rounds")
+
+    def _preferred_tool_provider(self) -> Any:
+        action_provider = self.config_store.config.action_api
+        if self._provider_ready(action_provider):
+            return action_provider
+        return self.config_store.config.chat_api
+
+    def _provider_ready(self, provider: Any) -> bool:
+        return bool(
+            getattr(provider, "enabled", False)
+            and getattr(provider, "base_url", "")
+            and getattr(provider, "api_key", "")
+            and getattr(provider, "model", "")
+        )
+
+    def _provider_is_chat(self, provider: Any) -> bool:
+        return provider is self.config_store.config.chat_api
+
+    def provider_status_payload(self) -> Dict[str, Any]:
+        config = self.config_store.config
+        return {
+            "chat_api": self._provider_status(config.chat_api),
+            "action_api": self._provider_status(config.action_api),
+            "search_api": self._provider_status(config.search_api),
+        }
+
+    def _provider_status(self, provider: Any) -> Dict[str, Any]:
+        return {
+            "enabled": bool(getattr(provider, "enabled", False)),
+            "configured": self._provider_ready(provider),
+            "label": str(getattr(provider, "label", "") or getattr(provider, "backend_type", "") or "unknown"),
+            "has_base_url": bool(getattr(provider, "base_url", "")),
+            "has_api_key": bool(getattr(provider, "api_key", "")),
+            "has_model": bool(getattr(provider, "model", "")),
+        }
+
+    def _synthesize_companion_reply(
+        self,
+        *,
+        messages: list[Dict[str, Any]],
+        tool_contexts: list[Dict[str, Any]],
+        session_id: str,
+        temperature: float,
+        fallback_content: str,
+    ) -> tuple[str, Dict[str, Any]]:
+        chat_provider = self.config_store.config.chat_api
+        if not self._provider_ready(chat_provider):
+            return fallback_content, {"choices": [{"message": {"content": fallback_content}, "finish_reason": "stop"}]}
+        response = request_chat_completion(
+            chat_provider,
+            self._build_main_chat_messages(messages, tool_contexts, session_id),
+            stream=False,
+            temperature=temperature,
+        )
+        content = extract_text_content(response).strip()
+        return (content or fallback_content), response
+
+    def _build_action_runtime_messages(
+        self,
+        messages: list[Dict[str, Any]],
+        tool_contexts: list[Dict[str, Any]],
+        session_id: str,
+    ) -> list[Dict[str, Any]]:
+        config = self.config_store.config
+        system_parts = [
+            "你是行动核（Action Runtime），不是直接对用户说话的伴侣人格。",
+            "你的职责是判断是否需要调用工具，并在需要时优先调用工具。",
+            "如果用户消息涉及链接、网页、文件、记忆检索、提醒、图片、搜索、外部信息获取，就优先用工具，不要直接假装自己看过。",
+            "如果不需要工具，给出极简事实性结论，交给聊天核再润色。",
+            "你输出给系统，不输出给最终用户；工具结果会回流给聊天核。",
+            f"当前伴侣名称：{config.persona.partner_name}；伴侣身份：{config.persona.partner_role}。",
+        ]
+        if tool_contexts:
+            lines = []
+            for index, item in enumerate(tool_contexts, start=1):
+                lines.append(
+                    f"[{index}] 类型: {item.get('type', 'unknown')}\n链接: {item.get('url', '')}\n备注: {item.get('note', '') or '无'}\n上下文: {item.get('context', '')}"
+                )
+            system_parts.append("已存在工具上下文如下，可直接利用，无需重复调用同类工具：\n\n" + "\n\n".join(lines))
+        recent_messages = []
+        if session_id:
+            recent_messages = self.runtime_store.list_recent_messages(
+                session_id,
+                limit=min(6, self.config_store.config.session.recent_message_limit),
+            )
+        if len(messages) > 1:
+            recent_messages = []
+        return [{"role": "system", "content": "\n".join(system_parts)}] + recent_messages + messages
+
+    def _chat_tool_specs(self, profile_id: str) -> list[Dict[str, Any]]:
+        specs: list[Dict[str, Any]] = []
+        for item in self.tools.list_enabled():
+            tool_id = str(item.get("id", "") or "")
+            if tool_id in {"send_proactive_message"}:
+                continue
+            specs.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_id,
+                        "description": str(item.get("description", "") or ""),
+                        "parameters": item.get("schema") or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+        return specs
+
+    def _enrich_tool_arguments(self, tool_name: str, arguments: Dict[str, Any], profile_id: str) -> Dict[str, Any]:
+        enriched = dict(arguments)
+        if tool_name in {"create_reminder", "send_proactive_message"} and not enriched.get("profile_id"):
+            enriched["profile_id"] = profile_id
+        return enriched
+
+    def _tool_result_to_context(self, tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if tool_name == "search_web":
+            return {
+                "type": "search",
+                "query": str(arguments.get("query", "") or ""),
+                "url": "",
+                "note": "",
+                "context": str(result.get("summary", "") or ""),
+                "route_used": str(result.get("route_used", "") or ""),
+                "provider_used": str(result.get("provider_used", "") or ""),
+            }
+        if tool_name == "read_shared_link":
+            return {
+                "type": "shared_link",
+                "url": str(result.get("url", "") or arguments.get("url", "") or ""),
+                "note": str(arguments.get("note", "") or ""),
+                "context": str(result.get("context", "") or ""),
+                "route_used": str(result.get("route_used", "") or ""),
+                "provider_used": str(result.get("provider_used", "") or ""),
+            }
+        if tool_name == "analyze_image":
+            return {
+                "type": "image",
+                "url": str(result.get("url", "") or arguments.get("url", "") or arguments.get("image_url", "") or ""),
+                "note": str(arguments.get("note", "") or ""),
+                "context": str(result.get("context", "") or ""),
+                "route_used": str(result.get("route_used", "") or ""),
+                "provider_used": str(result.get("provider_used", "") or ""),
+            }
+        if tool_name == "search_memory":
+            items = result.get("items") or []
+            snippets = [str(item.get("content", "") or "")[:120] for item in items[:5] if isinstance(item, dict)]
+            return {
+                "type": "memory_search",
+                "query": str(arguments.get("query", "") or ""),
+                "url": "",
+                "note": "",
+                "context": "\n".join(snippets),
+            }
+        if tool_name == "create_reminder":
+            return {
+                "type": "reminder",
+                "url": "",
+                "note": str(arguments.get("content", "") or ""),
+                "context": f"已创建提醒：{result.get('content', '')}，触发时间：{result.get('trigger_at', '')}",
+            }
+        return None
 
     def handle_feishu_message(self, inbound: Dict[str, Any]) -> Iterable[str]:
         prompt = str(inbound.get("text", "") or "").strip()
@@ -271,6 +537,37 @@ class GatewayApp:
             },
         )
 
+    def handle_napcat_message(self, inbound: Dict[str, Any]) -> Iterable[str]:
+        prompt = str(inbound.get("text", "") or "").strip()
+        messages = [{"role": "user", "content": prompt}] if prompt else []
+        if not messages:
+            return []
+        profile_id = self._profile_id_for_inbound(inbound)
+        _, session = self._resolve_request_session(
+            {
+                "profile_id": profile_id,
+                "channel": "qq",
+                "channel_user_id": inbound.get("user_id", ""),
+                "chat_id": inbound.get("group_id", ""),
+                "thread_id": "",
+            }
+        )
+        return self.stream_chat_reply(
+            messages=messages,
+            profile_id=profile_id,
+            session_id=session.session_id,
+            channel="qq",
+            temperature=0.7,
+            event_type="qq_chat_respond",
+            event_payload={
+                "channel": "qq",
+                "user_id": inbound.get("user_id", ""),
+                "group_id": inbound.get("group_id", ""),
+                "message_type": inbound.get("message_type", "private"),
+                "message_id": inbound.get("message_id", ""),
+            },
+        )
+
     def _build_feishu_channel(self):
         channels = self.config_store.config.channels
         if not channels.feishu_enabled:
@@ -289,6 +586,22 @@ class GatewayApp:
                 card_title=channels.feishu_card_title,
                 patch_interval_ms=channels.feishu_patch_interval_ms,
                 patch_min_chars=channels.feishu_patch_min_chars,
+            )
+        )
+
+    def _build_napcat_channel(self):
+        channels = self.config_store.config.channels
+        if not channels.napcat_enabled:
+            return None
+        if not channels.napcat_base_url:
+            return None
+        from .channels.napcat import NapcatChannel, NapcatChannelConfig
+
+        return NapcatChannel(
+            NapcatChannelConfig(
+                base_url=channels.napcat_base_url,
+                access_token=channels.napcat_access_token,
+                enabled=channels.napcat_enabled,
             )
         )
 
@@ -318,16 +631,17 @@ class GatewayApp:
 
     def _build_main_chat_messages(
         self,
-        messages: list[Dict[str, str]],
+        messages: list[Dict[str, Any]],
         tool_contexts: list[Dict[str, Any]],
         session_id: str = "",
-    ) -> list[Dict[str, str]]:
+    ) -> list[Dict[str, Any]]:
         config = self.config_store.config
         system_parts = [
             f"你是用户的 {config.persona.partner_role}，名字是 {config.persona.partner_name}。",
             f"说话风格：{config.persona.core_identity}",
             f"边界要求：{config.persona.boundaries}",
             "你是唯一直接对用户说话的模型。工具层、搜索层、识图层都只能给你补充上下文，不能替你发言。",
+            "默认先用工具层/行动层完成搜索、读链接、识图、记忆检索和提醒创建；只有工具失败、未配置，或纯陪伴聊天不需要工具时，才由你直接兜底回答。",
         ]
         core_profile = self._read_text_file(self._core_memory_file())
         active_memory = self._read_text_file(self._active_memory_file())
@@ -355,27 +669,82 @@ class GatewayApp:
             recent_messages = []
         return [{"role": "system", "content": "\n".join(system_parts)}] + recent_messages + messages
 
-    def _prepare_tool_contexts(self, attachments: list[Dict[str, Any]], search_query: str) -> list[Dict[str, Any]]:
+    def _prepare_tool_contexts(
+        self,
+        messages: list[Dict[str, Any]],
+        attachments: list[Dict[str, Any]],
+        search_query: str,
+    ) -> list[Dict[str, Any]]:
         tool_contexts = []
+        seen_urls: set[str] = set()
         if search_query:
-            tool_contexts.append(prepare_search_context(self.config_store.config, search_query))
+            context = prepare_search_context(self.config_store.config, search_query)
+            tool_contexts.append(context)
+            self._record_event("tool_execute", {"tool": "search_web", "query": search_query, "route_used": context.get("route_used", "")})
+        for url in self._extract_urls_from_messages(messages):
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                context = prepare_shared_link_context(self.config_store.config, url, "")
+            except Exception as error:
+                context = {
+                    "type": "shared_link",
+                    "url": url,
+                    "note": "",
+                    "excerpt": "",
+                    "context": f"链接预处理失败：{error}",
+                    "route_used": "failed",
+                    "provider_used": "none",
+                }
+            tool_contexts.append(context)
+            self._record_event("tool_execute", {"tool": "read_shared_link", "url": url, "route_used": context.get("route_used", "")})
         for attachment in attachments:
             attachment_type = str(attachment.get("type", "") or "").strip().lower()
             if attachment_type in {"url", "link", "shared_link"}:
                 url = str(attachment.get("url", "") or "").strip()
                 note = str(attachment.get("note", "") or "").strip()
-                if url:
-                    tool_contexts.append(prepare_shared_link_context(self.config_store.config, url, note))
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    try:
+                        context = prepare_shared_link_context(self.config_store.config, url, note)
+                    except Exception as error:
+                        context = {
+                            "type": "shared_link",
+                            "url": url,
+                            "note": note,
+                            "excerpt": "",
+                            "context": f"链接预处理失败：{error}",
+                            "route_used": "failed",
+                            "provider_used": "none",
+                        }
+                    tool_contexts.append(context)
+                    self._record_event("tool_execute", {"tool": "read_shared_link", "url": url, "route_used": context.get("route_used", "")})
             if attachment_type in {"image", "image_url", "photo"}:
                 image_url = str(attachment.get("url", "") or attachment.get("image_url", "") or "").strip()
                 note = str(attachment.get("note", "") or "").strip()
                 if image_url:
-                    tool_contexts.append(prepare_image_context(self.config_store.config, image_url, note, self.root))
+                    context = prepare_image_context(self.config_store.config, image_url, note, self.root)
+                    tool_contexts.append(context)
+                    self._record_event("tool_execute", {"tool": "analyze_image", "url": image_url, "route_used": context.get("route_used", "")})
             if attachment_type in {"search", "web_search"}:
                 query = str(attachment.get("query", "") or attachment.get("text", "") or "").strip()
                 if query:
-                    tool_contexts.append(prepare_search_context(self.config_store.config, query))
+                    context = prepare_search_context(self.config_store.config, query)
+                    tool_contexts.append(context)
+                    self._record_event("tool_execute", {"tool": "search_web", "query": query, "route_used": context.get("route_used", "")})
         return tool_contexts
+
+    def _extract_urls_from_messages(self, messages: list[Dict[str, Any]]) -> list[str]:
+        urls: list[str] = []
+        pattern = re.compile(r"https?://[^\s<>()\[\]{}\"']+")
+        for message in messages:
+            if str(message.get("role", "") or "") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                urls.extend(pattern.findall(content))
+        return urls
 
     def list_memories_grouped(self, category: str = "") -> Dict[str, Any]:
         records = [self._serialize_memory(record) for record in self.memory_store.list_memories(limit=1000)]
@@ -476,6 +845,12 @@ class GatewayApp:
             chat_id = str(profile.get("chat_id", "") or "")
             chat_type = "p2p" if not chat_id else "group"
             self.feishu_channel.send_text(open_id, content, chat_id=chat_id, chat_type=chat_type)
+            delivered = True
+        elif channel == "qq" and self.napcat_channel is not None:
+            user_id = str(profile.get("channel_user_id", "") or "")
+            group_id = str(profile.get("chat_id", "") or "")
+            message_type = "group" if group_id else "private"
+            self.napcat_channel.send_text(user_id, content, group_id=group_id, message_type=message_type)
             delivered = True
         else:
             note = "no live outbound channel was available; event recorded only"
@@ -599,6 +974,15 @@ class GatewayApp:
         self._refresh_active_memory()
 
     def _profile_id_for_inbound(self, inbound: Dict[str, Any]) -> str:
+        channel = str(inbound.get("channel", "") or "").strip().lower()
+        if channel == "qq":
+            group_id = str(inbound.get("group_id", "") or "").strip()
+            user_id = str(inbound.get("user_id", "") or "").strip()
+            if group_id:
+                return f"qq-group:{group_id}"
+            if user_id:
+                return f"qq:{user_id}"
+            return "qq:anonymous"
         open_id = str(inbound.get("open_id", "") or "").strip()
         if open_id:
             return f"feishu:{open_id}"
@@ -799,6 +1183,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/config":
                 self._json(HTTPStatus.OK, app.public_config_payload())
                 return
+            if parsed.path == "/api/providers/status":
+                self._json(HTTPStatus.OK, app.provider_status_payload())
+                return
+            if parsed.path == "/api/channels/qq/status":
+                self._json(HTTPStatus.OK, {"qq": app.napcat_channel.status() if app.napcat_channel else {"enabled": False, "ready": False}})
+                return
             if parsed.path == "/api/tools":
                 self._json(HTTPStatus.OK, {"tools": app.tools.list_enabled()})
                 return
@@ -851,6 +1241,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             if parsed.path == "/api/config":
                 self._json(HTTPStatus.OK, app.update_config(body))
+                return
+            if parsed.path == "/api/channels/qq/inbound":
+                if app.napcat_channel is None:
+                    raise ValueError("qq channel is not enabled")
+                app.napcat_channel.handle_event(body)
+                self._json(HTTPStatus.OK, {"ok": True})
                 return
             if parsed.path == "/api/memories":
                 self._json(HTTPStatus.CREATED, app.upsert_panel_memory(body))
