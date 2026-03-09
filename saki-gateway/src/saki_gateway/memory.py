@@ -41,6 +41,7 @@ class MemoryRecord:
     id: str
     key: str
     content: str
+    memory_kind: str
     category: str
     importance: float
     session_id: str
@@ -52,7 +53,9 @@ class MemoryRecord:
 
 
 class MemoryStore:
-    def __init__(self, db_path: Path, vector_weight: float = 0.7, keyword_weight: float = 0.3):
+    def __init__(
+        self, db_path: Path, vector_weight: float = 0.7, keyword_weight: float = 0.3
+    ):
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.vector_weight = vector_weight
@@ -74,6 +77,7 @@ class MemoryStore:
               id TEXT PRIMARY KEY,
               key TEXT NOT NULL,
               content TEXT NOT NULL,
+              memory_kind TEXT NOT NULL DEFAULT 'long_term',
               category TEXT NOT NULL,
               importance REAL DEFAULT 0.5,
               session_id TEXT DEFAULT '',
@@ -114,13 +118,25 @@ class MemoryStore:
             );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in self.conn.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            if "memory_kind" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE memories ADD COLUMN memory_kind TEXT NOT NULL DEFAULT 'long_term'"
+                )
             self.conn.commit()
 
     def add_event(self, event_type: str, payload: dict[str, Any]) -> None:
         with self._lock:
             self.conn.execute(
                 "INSERT INTO events(event_type, payload, created_at) VALUES(?, ?, ?)",
-                (event_type, json.dumps(payload, ensure_ascii=False), datetime.utcnow().isoformat()),
+                (
+                    event_type,
+                    json.dumps(payload, ensure_ascii=False),
+                    datetime.utcnow().isoformat(),
+                ),
             )
             self.conn.commit()
 
@@ -152,6 +168,7 @@ class MemoryStore:
         memory_id: str,
         key: str,
         content: str,
+        memory_kind: str = "long_term",
         category: str = "other",
         importance: float = 0.5,
         session_id: str = "",
@@ -165,11 +182,12 @@ class MemoryStore:
             ).fetchone()
             self.conn.execute(
                 """
-            INSERT INTO memories(id, key, content, category, importance, session_id, created_at, updated_at, embedding)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories(id, key, content, memory_kind, category, importance, session_id, created_at, updated_at, embedding)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               key=excluded.key,
               content=excluded.content,
+              memory_kind=excluded.memory_kind,
               category=excluded.category,
               importance=excluded.importance,
               session_id=excluded.session_id,
@@ -180,6 +198,7 @@ class MemoryStore:
                     memory_id,
                     key,
                     content,
+                    memory_kind,
                     category,
                     importance,
                     session_id,
@@ -189,10 +208,22 @@ class MemoryStore:
                 ),
             )
             self.conn.commit()
-            row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         return self._row_to_record(row)
 
-    def list_memories(self, limit: int = 50) -> List[MemoryRecord]:
+    def list_memories(
+        self, limit: int = 50, memory_kind: str = "long_term"
+    ) -> List[MemoryRecord]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM memories WHERE memory_kind = ? ORDER BY updated_at DESC LIMIT ?",
+                (memory_kind, limit),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
+    def list_all_memories(self, limit: int = 50) -> List[MemoryRecord]:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?",
@@ -202,18 +233,28 @@ class MemoryStore:
 
     def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
         if row is None:
             return None
         return self._row_to_record(row)
 
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock:
-            cursor = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            cursor = self.conn.execute(
+                "DELETE FROM memories WHERE id = ?", (memory_id,)
+            )
             self.conn.commit()
         return cursor.rowcount > 0
 
-    def search(self, query: str, query_embedding: Optional[List[float]] = None, limit: int = 8) -> List[MemoryRecord]:
+    def search(
+        self,
+        query: str,
+        query_embedding: Optional[List[float]] = None,
+        limit: int = 8,
+        memory_kind: str = "long_term",
+    ) -> List[MemoryRecord]:
         fallback_limit = max(limit * 3, limit)
         try:
             with self._lock:
@@ -222,11 +263,11 @@ class MemoryStore:
                 SELECT m.*, bm25(memories_fts) AS keyword_score
                 FROM memories_fts
                 JOIN memories m ON m.rowid = memories_fts.rowid
-                WHERE memories_fts MATCH ?
+                WHERE memories_fts MATCH ? AND m.memory_kind = ?
                 ORDER BY keyword_score
                 LIMIT ?
                     """,
-                    (query, fallback_limit),
+                    (query, memory_kind, fallback_limit),
                 ).fetchall()
         except sqlite3.Error:
             keyword_rows = []
@@ -237,18 +278,22 @@ class MemoryStore:
                     """
                 SELECT *, 0.5 AS keyword_score
                 FROM memories
-                WHERE key LIKE ? OR content LIKE ?
+                WHERE memory_kind = ? AND (key LIKE ? OR content LIKE ?)
                 ORDER BY updated_at DESC
                 LIMIT ?
                     """,
-                    (f"%{query}%", f"%{query}%", fallback_limit),
+                    (memory_kind, f"%{query}%", f"%{query}%", fallback_limit),
                 ).fetchall()
 
         keyword_hits = []
         if keyword_rows:
-            max_score = max(abs(float(row["keyword_score"])) for row in keyword_rows) or 1.0
+            max_score = (
+                max(abs(float(row["keyword_score"])) for row in keyword_rows) or 1.0
+            )
             for row in keyword_rows:
-                normalized = 1.0 - min(abs(float(row["keyword_score"])) / max_score, 1.0)
+                normalized = 1.0 - min(
+                    abs(float(row["keyword_score"])) / max_score, 1.0
+                )
                 record = self._row_to_record(row)
                 record.keyword_score = normalized
                 keyword_hits.append(record)
@@ -256,9 +301,14 @@ class MemoryStore:
         vector_hits = []
         if query_embedding:
             with self._lock:
-                rows = self.conn.execute("SELECT * FROM memories WHERE length(embedding) > 0").fetchall()
+                rows = self.conn.execute(
+                    "SELECT * FROM memories WHERE memory_kind = ? AND length(embedding) > 0",
+                    (memory_kind,),
+                ).fetchall()
             for row in rows:
-                score = cosine_similarity(query_embedding, unpack_embedding(row["embedding"]))
+                score = cosine_similarity(
+                    query_embedding, unpack_embedding(row["embedding"])
+                )
                 if score <= 0.0:
                     continue
                 record = self._row_to_record(row)
@@ -292,6 +342,9 @@ class MemoryStore:
             id=row["id"],
             key=row["key"],
             content=row["content"],
+            memory_kind=row["memory_kind"]
+            if "memory_kind" in row.keys()
+            else "long_term",
             category=row["category"],
             importance=float(row["importance"]),
             session_id=row["session_id"],

@@ -151,7 +151,9 @@ class RuntimeStore:
             session_id = ""
             if row is not None:
                 last_activity = self._parse_time(str(row["last_activity_at"]))
-                if datetime.utcnow() - last_activity <= timedelta(minutes=max(idle_rotation_minutes, 1)):
+                if datetime.utcnow() - last_activity <= timedelta(
+                    minutes=max(idle_rotation_minutes, 1)
+                ):
                     session_id = str(row["session_id"])
                     self.conn.execute(
                         """
@@ -159,7 +161,15 @@ class RuntimeStore:
                         SET channel = ?, channel_user_id = ?, chat_id = ?, thread_id = ?, updated_at = ?, last_activity_at = ?
                         WHERE session_id = ?
                         """,
-                        (channel, channel_user_id, chat_id, thread_id, now, now, session_id),
+                        (
+                            channel,
+                            channel_user_id,
+                            chat_id,
+                            thread_id,
+                            now,
+                            now,
+                            session_id,
+                        ),
                     )
             if not session_id:
                 session_id = f"sess_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
@@ -168,7 +178,17 @@ class RuntimeStore:
                     INSERT INTO sessions(session_id, profile_id, channel, channel_user_id, chat_id, thread_id, status, created_at, updated_at, last_activity_at)
                     VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                     """,
-                    (session_id, profile_id, channel, channel_user_id, chat_id, thread_id, now, now, now),
+                    (
+                        session_id,
+                        profile_id,
+                        channel,
+                        channel_user_id,
+                        chat_id,
+                        thread_id,
+                        now,
+                        now,
+                        now,
+                    ),
                 )
             self._touch_profile(
                 profile_id=profile_id,
@@ -184,12 +204,16 @@ class RuntimeStore:
 
     def get_session(self, session_id: str) -> SessionRecord:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
         if row is None:
             raise KeyError("session not found")
         return self._row_to_session(row)
 
-    def list_sessions(self, profile_id: str = "", limit: int = 20) -> List[SessionRecord]:
+    def list_sessions(
+        self, profile_id: str = "", limit: int = 20
+    ) -> List[SessionRecord]:
         with self._lock:
             if profile_id:
                 rows = self.conn.execute(
@@ -220,23 +244,126 @@ class RuntimeStore:
                 INSERT INTO session_messages(session_id, profile_id, role, content, channel, metadata, created_at)
                 VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, profile_id, role, content, channel, json.dumps(metadata or {}, ensure_ascii=False), now),
+                (
+                    session_id,
+                    profile_id,
+                    role,
+                    content,
+                    channel,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                ),
             )
             self.conn.execute(
                 "UPDATE sessions SET updated_at = ?, last_activity_at = ? WHERE session_id = ?",
                 (now, now, session_id),
             )
-            self._touch_profile(profile_id=profile_id, channel=channel, session_id=session_id, interaction_at=now)
+            self._touch_profile(
+                profile_id=profile_id,
+                channel=channel,
+                session_id=session_id,
+                interaction_at=now,
+            )
             self.conn.commit()
 
-    def list_recent_messages(self, session_id: str, limit: int = 12) -> List[Dict[str, str]]:
+    def list_recent_messages(
+        self, session_id: str, limit: int = 12
+    ) -> List[Dict[str, str]]:
         with self._lock:
             rows = self.conn.execute(
                 "SELECT role, content FROM session_messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
-        items = [{"role": str(row["role"]), "content": str(row["content"])} for row in reversed(rows)]
+        items = [
+            {"role": str(row["role"]), "content": str(row["content"])}
+            for row in reversed(rows)
+        ]
         return items
+
+    def list_messages_between(
+        self,
+        *,
+        profile_id: str = "",
+        session_id: str = "",
+        start_at: str = "",
+        end_at: str = "",
+        limit: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        values: List[Any] = []
+        if profile_id:
+            clauses.append("profile_id = ?")
+            values.append(profile_id)
+        if session_id:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if start_at:
+            clauses.append("created_at >= ?")
+            values.append(start_at)
+        if end_at:
+            clauses.append("created_at < ?")
+            values.append(end_at)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self.conn.execute(
+                f"""
+                SELECT id, session_id, profile_id, role, content, channel, metadata, created_at
+                FROM session_messages
+                {where}
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (*values, limit),
+            ).fetchall()
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {"raw": row["metadata"]}
+            items.append(
+                {
+                    "id": int(row["id"]),
+                    "session_id": str(row["session_id"]),
+                    "profile_id": str(row["profile_id"]),
+                    "role": str(row["role"]),
+                    "content": str(row["content"]),
+                    "channel": str(row["channel"] or ""),
+                    "metadata": metadata,
+                    "created_at": str(row["created_at"]),
+                }
+            )
+        return items
+
+    def count_messages_between(
+        self,
+        *,
+        profile_id: str = "",
+        session_id: str = "",
+        start_at: str = "",
+        end_at: str = "",
+    ) -> int:
+        clauses: List[str] = []
+        values: List[Any] = []
+        if profile_id:
+            clauses.append("profile_id = ?")
+            values.append(profile_id)
+        if session_id:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if start_at:
+            clauses.append("created_at >= ?")
+            values.append(start_at)
+        if end_at:
+            clauses.append("created_at < ?")
+            values.append(end_at)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            row = self.conn.execute(
+                f"SELECT COUNT(*) AS count FROM session_messages {where}",
+                tuple(values),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
 
     def add_event(
         self,
@@ -269,7 +396,9 @@ class RuntimeStore:
             with self.event_log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
-    def list_events(self, profile_id: str = "", session_id: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    def list_events(
+        self, profile_id: str = "", session_id: str = "", limit: int = 50
+    ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
         values: List[Any] = []
         if profile_id:
@@ -320,19 +449,32 @@ class RuntimeStore:
                 INSERT INTO reminders(reminder_id, profile_id, content, trigger_at, status, channel, metadata, created_at, updated_at, delivered_at)
                 VALUES(?, ?, ?, ?, 'pending', ?, ?, ?, ?, '')
                 """,
-                (reminder_id, profile_id, content, trigger_at, channel, json.dumps(metadata or {}, ensure_ascii=False), now, now),
+                (
+                    reminder_id,
+                    profile_id,
+                    content,
+                    trigger_at,
+                    channel,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
             )
             self.conn.commit()
         return self.get_reminder(reminder_id)
 
     def get_reminder(self, reminder_id: str) -> ReminderRecord:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM reminders WHERE reminder_id = ?", (reminder_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM reminders WHERE reminder_id = ?", (reminder_id,)
+            ).fetchone()
         if row is None:
             raise KeyError("reminder not found")
         return self._row_to_reminder(row)
 
-    def list_reminders(self, profile_id: str = "", status: str = "", limit: int = 100) -> List[ReminderRecord]:
+    def list_reminders(
+        self, profile_id: str = "", status: str = "", limit: int = 100
+    ) -> List[ReminderRecord]:
         clauses: List[str] = []
         values: List[Any] = []
         if profile_id:
@@ -349,7 +491,9 @@ class RuntimeStore:
             ).fetchall()
         return [self._row_to_reminder(row) for row in rows]
 
-    def list_due_reminders(self, now_iso: Optional[str] = None, limit: int = 20) -> List[ReminderRecord]:
+    def list_due_reminders(
+        self, now_iso: Optional[str] = None, limit: int = 20
+    ) -> List[ReminderRecord]:
         moment = now_iso or utcnow_iso()
         with self._lock:
             rows = self.conn.execute(
@@ -374,13 +518,19 @@ class RuntimeStore:
 
     def delete_reminder(self, reminder_id: str) -> bool:
         with self._lock:
-            cursor = self.conn.execute("DELETE FROM reminders WHERE reminder_id = ?", (reminder_id,))
+            cursor = self.conn.execute(
+                "DELETE FROM reminders WHERE reminder_id = ?", (reminder_id,)
+            )
             self.conn.commit()
         return cursor.rowcount > 0
 
-    def list_inactive_profiles(self, *, idle_hours: int, proactive_cooldown_hours: int, limit: int = 10) -> List[Dict[str, str]]:
+    def list_inactive_profiles(
+        self, *, idle_hours: int, proactive_cooldown_hours: int, limit: int = 10
+    ) -> List[Dict[str, str]]:
         cutoff = (datetime.utcnow() - timedelta(hours=max(idle_hours, 1))).isoformat()
-        cooldown_cutoff = (datetime.utcnow() - timedelta(hours=max(proactive_cooldown_hours, 1))).isoformat()
+        cooldown_cutoff = (
+            datetime.utcnow() - timedelta(hours=max(proactive_cooldown_hours, 1))
+        ).isoformat()
         with self._lock:
             rows = self.conn.execute(
                 """
@@ -406,7 +556,9 @@ class RuntimeStore:
 
     def profile_state(self, profile_id: str) -> Dict[str, Any]:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
+            ).fetchone()
         if row is None:
             return {}
         return dict(row)
@@ -437,14 +589,26 @@ class RuntimeStore:
         interaction_at: Optional[str] = None,
     ) -> None:
         now = interaction_at or utcnow_iso()
-        existing = self.conn.execute("SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)).fetchone()
+        existing = self.conn.execute(
+            "SELECT * FROM profiles WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
         if existing is None:
             self.conn.execute(
                 """
                 INSERT INTO profiles(profile_id, last_channel, channel_user_id, chat_id, thread_id, last_session_id, last_interaction_at, last_proactive_at, created_at, updated_at)
                 VALUES(?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 """,
-                (profile_id, channel, channel_user_id, chat_id, thread_id, session_id, now, now, now),
+                (
+                    profile_id,
+                    channel,
+                    channel_user_id,
+                    chat_id,
+                    thread_id,
+                    session_id,
+                    now,
+                    now,
+                    now,
+                ),
             )
             return
         self.conn.execute(
