@@ -98,10 +98,17 @@ class GatewayScheduler:
         if not config.proactive_enabled:
             return
         current_hour = datetime.now().hour
-        if current_hour < 8 or current_hour > 22:
+        day_start = max(0, min(23, int(config.proactive_day_start_hour)))
+        day_end = max(0, min(23, int(config.proactive_day_end_hour)))
+        if day_start <= day_end:
+            in_window = day_start <= current_hour <= day_end
+        else:
+            in_window = current_hour >= day_start or current_hour <= day_end
+        if not in_window:
             return
         candidates = self.store.list_inactive_profiles(
             idle_hours=config.proactive_idle_hours,
+            idle_minutes=config.proactive_idle_minutes,
             proactive_cooldown_hours=config.proactive_cooldown_hours,
             limit=config.proactive_max_profiles_per_tick,
         )

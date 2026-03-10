@@ -525,9 +525,20 @@ class RuntimeStore:
         return cursor.rowcount > 0
 
     def list_inactive_profiles(
-        self, *, idle_hours: int, proactive_cooldown_hours: int, limit: int = 10
+        self,
+        *,
+        idle_hours: int,
+        proactive_cooldown_hours: int,
+        limit: int = 10,
+        idle_minutes: int = 0,
     ) -> List[Dict[str, str]]:
-        cutoff = (datetime.utcnow() - timedelta(hours=max(idle_hours, 1))).isoformat()
+        idle_delta = timedelta(
+            minutes=max(idle_minutes, 0),
+            hours=max(idle_hours, 0),
+        )
+        if idle_delta.total_seconds() <= 0:
+            idle_delta = timedelta(hours=1)
+        cutoff = (datetime.utcnow() - idle_delta).isoformat()
         cooldown_cutoff = (
             datetime.utcnow() - timedelta(hours=max(proactive_cooldown_hours, 1))
         ).isoformat()
