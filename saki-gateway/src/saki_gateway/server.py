@@ -244,12 +244,7 @@ class GatewayApp:
         }
 
     def start_channels(self) -> None:
-        if self.feishu_channel is not None:
-            self.feishu_channel.start(self.handle_feishu_message)
-        if self.qqbot_channel is not None:
-            self.qqbot_channel.start(self.handle_qqbot_message)
-        if self.napcat_channel is not None:
-            self.napcat_channel.start(self.handle_napcat_message)
+        self._start_channels_best_effort()
         self.scheduler.start()
 
     def shutdown(self) -> None:
@@ -274,14 +269,38 @@ class GatewayApp:
         self.feishu_channel = self._build_feishu_channel()
         self.qqbot_channel = self._build_qqbot_channel()
         self.napcat_channel = self._build_napcat_channel()
-        if self.feishu_channel is not None:
-            self.feishu_channel.start(self.handle_feishu_message)
-        if self.qqbot_channel is not None:
-            self.qqbot_channel.start(self.handle_qqbot_message)
-        if self.napcat_channel is not None:
-            self.napcat_channel.start(self.handle_napcat_message)
+        warnings = self._start_channels_best_effort()
         self.scheduler.start()
-        return {"config": self.public_config_payload()}
+        response = {"config": self.public_config_payload()}
+        if warnings:
+            response["warnings"] = warnings
+        return response
+
+    def _start_channels_best_effort(self) -> list[Dict[str, str]]:
+        warnings: list[Dict[str, str]] = []
+        channels = [
+            ("feishu", self.feishu_channel, self.handle_feishu_message),
+            ("qqbot", self.qqbot_channel, self.handle_qqbot_message),
+            ("qq", self.napcat_channel, self.handle_napcat_message),
+        ]
+        for channel_name, channel, handler in channels:
+            if channel is None:
+                continue
+            try:
+                channel.start(handler)
+            except Exception as error:
+                warnings.append(
+                    {
+                        "channel": channel_name,
+                        "error": str(error),
+                    }
+                )
+                self._record_event(
+                    "channel_start_failed",
+                    {"channel": channel_name, "error": str(error)},
+                    channel=channel_name,
+                )
+        return warnings
 
     def chat_complete(self, body: Dict[str, Any]) -> Dict[str, Any]:
         messages = self._coerce_messages(body)

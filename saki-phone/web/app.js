@@ -1413,13 +1413,28 @@ class SakiPhoneApp {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) throw new Error('Save failed');
+      let result = null;
+      try {
+        result = await res.json();
+      } catch (_) {
+        result = null;
+      }
+      if (!res.ok) {
+        const detail = result?.error || result?.message || `HTTP ${res.status}`;
+        throw new Error(detail);
+      }
       if (section === 'dashboard_security') {
         this.showToast('密码设置已保存，正在刷新...', 'success');
         setTimeout(() => window.location.reload(), 800);
         return;
       }
-      this.showToast('已保存', 'success');
+      const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+      if (warnings.length > 0) {
+        const warningText = warnings.map(item => `${item.channel || 'channel'}: ${item.error || 'unknown error'}`).join('；');
+        this.showToast(`已保存，但部分通道启动失败：${warningText}`, 'warning');
+      } else {
+        this.showToast('已保存', 'success');
+      }
     } catch (err) {
       this.showToast(`保存失败: ${err.message}`, 'error');
     }
