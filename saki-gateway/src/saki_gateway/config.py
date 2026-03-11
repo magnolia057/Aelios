@@ -56,7 +56,7 @@ class MemoryConfig:
 class SessionConfig:
     enabled: bool = True
     idle_rotation_minutes: int = 360
-    recent_message_limit: int = 12
+    recent_message_limit: int = 30
 
 
 @dataclass

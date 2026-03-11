@@ -449,13 +449,17 @@ def build_default_registry(
                 "note": str(error),
                 "results": [],
             }
+        context = str(prepared.get("context", "") or "").strip()
+        route_used = str(prepared.get("route_used", "") or "")
+        available = bool(context) and route_used not in {"unavailable", "failed"}
         return {
             "query": query,
-            "available": True,
-            "model": prepared["model"],
-            "summary": prepared["context"],
-            "route_used": prepared["route_used"],
-            "provider_used": prepared["provider_used"],
+            "available": available,
+            "model": prepared.get("model", ""),
+            "summary": context,
+            "route_used": route_used,
+            "provider_used": prepared.get("provider_used", ""),
+            "note": "" if available else context or "search unavailable",
         }
 
     def search_memory(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -465,7 +469,19 @@ def build_default_registry(
         if not query:
             raise ValueError("query is required")
         limit = max(1, min(20, int(args.get("limit", 8) or 8)))
-        results = memory_store.search(query, limit=limit)
+        injected_categories = {
+            "preference",
+            "promise",
+            "anniversary",
+            "identity",
+            "relationship",
+        }
+        results = [
+            item
+            for item in memory_store.search(query, limit=max(limit * 2, 12))
+            if getattr(item, "category", "") not in injected_categories
+            and getattr(item, "category", "") != "memory_refresh"
+        ][:limit]
         return {
             "query": query,
             "items": [
@@ -606,12 +622,15 @@ def build_default_registry(
             user_note,
             _allowed_workspace_root(workspace_root),
         )
+        context = str(prepared.get("context", "") or "").strip()
+        route_used = str(prepared.get("route_used", "") or "")
+        available = bool(context) and route_used not in {"unavailable", "failed"}
         return {
             "url": image_url,
-            "available": True,
-            "context": prepared["context"],
-            "route_used": prepared["route_used"],
-            "provider_used": prepared["provider_used"],
+            "available": available,
+            "context": context,
+            "route_used": route_used,
+            "provider_used": prepared.get("provider_used", ""),
             "note": "This tool output is meant to be injected into the main chat model context, not sent to the user directly.",
         }
 

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 import uuid
+from pathlib import Path
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional
 
 
@@ -30,6 +32,7 @@ class FeishuInboundMessage:
     chat_type: str
     text: str
     thread_id: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
     raw: Optional[dict[str, Any]] = None
 
 
@@ -314,6 +317,42 @@ class FeishuChannel:
         if getattr(response, "code", -1) != 0:
             raise ValueError(f"feishu send text failed: {getattr(response, 'msg', 'unknown error')}")
 
+    def download_message_resource(self, message_id: str, resource_type: str, file_key: str, out_dir: str) -> str:
+        client = self._require_client()
+        import lark_oapi as lark
+
+        resource_type = str(resource_type or '').strip() or 'image'
+        target_dir = Path(out_dir).resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        request = (
+            lark.im.v1.GetMessageResourceRequest.builder()
+            .message_id(message_id)
+            .file_key(file_key)
+            .type(resource_type)
+            .build()
+        )
+        response = client.im.v1.message_resource.get(request)
+        if getattr(response, 'code', -1) != 0:
+            raise ValueError(f"feishu download resource failed: {getattr(response, 'msg', 'unknown error')}")
+        file_name = str(getattr(response, 'file_name', '') or '')
+        if not file_name:
+            suffix = '.bin'
+            if resource_type == 'image':
+                suffix = '.jpg'
+            file_name = f"{resource_type}_{file_key}{suffix}"
+        safe_name = os.path.basename(file_name)
+        target = target_dir / safe_name
+        body = getattr(response, 'raw', None) or getattr(response, 'file', None) or getattr(response, 'data', None)
+        content = getattr(body, 'content', None) if body is not None else None
+        if content is None and hasattr(response, 'content'):
+            content = getattr(response, 'content')
+        if content is None:
+            raise ValueError('feishu resource body is empty')
+        if isinstance(content, str):
+            content = content.encode('utf-8')
+        target.write_bytes(content)
+        return str(target)
+
     def _run_forever(self) -> None:
         try:
             import lark_oapi as lark
@@ -392,6 +431,7 @@ class FeishuChannel:
                         "chat_type": message.chat_type,
                         "thread_id": message.thread_id,
                         "text": message.text,
+                        "attachments": [dict(item, message_id=message.message_id) for item in message.attachments],
                     }
                 )
                 final_text = self._stream_to_card(card_id, message, chunks)
@@ -443,7 +483,11 @@ class FeishuChannel:
         if not message_id or self._seen_recently(message_id):
             return None
         message_type = str(getattr(message, "message_type", "") or "")
-        content = self._extract_message_text(message_type, str(getattr(message, "content", "") or ""))
+        raw_content = str(getattr(message, "content", "") or "")
+        content = self._extract_message_text(message_type, raw_content)
+        attachments = self._extract_attachments(message_type, raw_content)
+        if not content.strip() and attachments:
+            content = "[收到附件]"
         if not content.strip():
             content = "[暂不支持直接解析的消息类型]"
         return FeishuInboundMessage(
@@ -453,6 +497,7 @@ class FeishuChannel:
             chat_type=str(getattr(message, "chat_type", "") or "p2p"),
             text=content,
             thread_id=str(getattr(message, "thread_id", "") or ""),
+            attachments=attachments,
             raw=None,
         )
 
@@ -468,6 +513,24 @@ class FeishuChannel:
         if message_type == "post":
             return str(payload)
         return str(payload)
+
+    def _extract_attachments(self, message_type: str, content: str) -> list[dict[str, Any]]:
+        if not content:
+            return []
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+        attachments: list[dict[str, Any]] = []
+        if message_type == "image":
+            image_key = str(payload.get("image_key", "") or "").strip()
+            if image_key:
+                attachments.append({"type": "image", "image_key": image_key, "source": "feishu"})
+        elif message_type == "file":
+            file_key = str(payload.get("file_key", "") or "").strip()
+            if file_key:
+                attachments.append({"type": "file", "file_key": file_key, "file_name": str(payload.get("file_name", "") or ""), "source": "feishu"})
+        return attachments
 
     def _build_card(self, content: str, *, loading: bool) -> dict[str, Any]:
         safe_text = self._truncate_card_text(content)

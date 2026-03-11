@@ -61,7 +61,7 @@ class QQBotChannel:
         self._recent_lock = threading.Lock()
         self._gateway_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._gateway_loop_ref: Optional[asyncio.AbstractEventLoop] = None
         self._gateway_ws: Any = None
         self._gateway_seq: Optional[int] = None
         self._gateway_session_id = ""
@@ -83,15 +83,15 @@ class QQBotChannel:
         self._stop_event.set()
         self._ready = False
         self._last_error = "stopped"
-        if self._gateway_loop is not None:
+        if self._gateway_loop_ref is not None:
             try:
-                self._gateway_loop.call_soon_threadsafe(lambda: None)
+                self._gateway_loop_ref.call_soon_threadsafe(lambda: None)
             except Exception:
                 pass
         if self._gateway_thread and self._gateway_thread.is_alive():
             self._gateway_thread.join(timeout=5)
         self._gateway_ws = None
-        self._gateway_loop = None
+        self._gateway_loop_ref = None
         self._gateway_thread = None
         self._event_handler = None
 
@@ -173,7 +173,7 @@ class QQBotChannel:
         try:
             chunks = self._event_handler(
                 {
-                    "channel": "qq",
+                    "channel": "qqbot",
                     "message_id": normalized.message_id,
                     "user_id": normalized.user_id,
                     "group_id": normalized.group_id,
@@ -191,7 +191,7 @@ class QQBotChannel:
                     final_text,
                     group_id=normalized.group_id,
                     message_type=normalized.message_type,
-                    reply_to=normalized.message_id,
+                    reply_to="",
                 )
         except Exception as error:
             self._last_error = str(error)
@@ -218,44 +218,65 @@ class QQBotChannel:
         if self._gateway_thread and self._gateway_thread.is_alive():
             return
         self._gateway_thread = threading.Thread(
-            target=self._gateway_loop,
+            target=self._gateway_loop_worker,
             name="qqbot-gateway",
             daemon=True,
         )
         self._gateway_thread.start()
 
-    def _gateway_loop(self) -> None:
-        self._gateway_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._gateway_loop)
-        self._gateway_loop.run_until_complete(self._gateway_loop_async())
-        self._gateway_loop.close()
+    def _gateway_loop_worker(self) -> None:
+        self._gateway_loop_ref = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._gateway_loop_ref)
+        try:
+            self._gateway_loop_ref.run_until_complete(self._gateway_loop_async())
+        except BaseException as error:
+            self._ready = False
+            self._last_error = f"qqbot gateway worker stopped: {error}"
+        finally:
+            self._gateway_ws = None
+            try:
+                self._gateway_loop_ref.close()
+            except Exception:
+                pass
 
     async def _gateway_loop_async(self) -> None:
+        retry_delay = 3.0
         while not self._stop_event.is_set():
+            heartbeat_task: Optional[asyncio.Task] = None
             try:
                 gateway_url = self._get_gateway_url()
                 async with websockets.connect(gateway_url, ping_interval=None) as ws:
                     self._gateway_ws = ws
                     self._ready = True
                     self._last_error = ""
+                    retry_delay = 3.0
                     hello_raw = await ws.recv()
                     await self._on_ws_message(str(hello_raw))
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-                    try:
-                        while not self._stop_event.is_set():
-                            raw = await ws.recv()
-                            await self._on_ws_message(str(raw))
-                    finally:
-                        heartbeat_task.cancel()
-                        try:
-                            await heartbeat_task
-                        except Exception:
-                            pass
-            except Exception as error:
+                    while not self._stop_event.is_set():
+                        raw = await ws.recv()
+                        await self._on_ws_message(str(raw))
+            except asyncio.CancelledError:
+                self._ready = False
+                self._last_error = "qqbot gateway cancelled"
+                if self._stop_event.is_set():
+                    break
+            except BaseException as error:
                 self._ready = False
                 self._last_error = str(error)
+            finally:
+                self._gateway_ws = None
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
             if not self._stop_event.is_set():
-                await asyncio.sleep(5)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30.0)
 
     async def _on_ws_message(self, raw: str) -> None:
         try:
@@ -295,13 +316,19 @@ class QQBotChannel:
             self._dispatch_inbound(normalized)
 
     async def _heartbeat_loop(self) -> None:
-        while not self._stop_event.is_set() and self._gateway_ws is not None:
-            await asyncio.sleep(self._heartbeat_interval)
-            if self._stop_event.is_set() or self._gateway_ws is None:
-                break
-            await self._gateway_ws.send(
-                json.dumps({"op": 1, "d": self._gateway_seq}, ensure_ascii=False)
-            )
+        try:
+            while not self._stop_event.is_set() and self._gateway_ws is not None:
+                await asyncio.sleep(self._heartbeat_interval)
+                if self._stop_event.is_set() or self._gateway_ws is None:
+                    break
+                await self._gateway_ws.send(
+                    json.dumps({"op": 1, "d": self._gateway_seq}, ensure_ascii=False)
+                )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            self._ready = False
+            self._last_error = f"qqbot heartbeat failed: {error}"
 
     async def _send_identify(self) -> None:
         token = self._get_access_token()
@@ -342,7 +369,7 @@ class QQBotChannel:
         content = self._sanitize_inbound_text(
             str(data.get("content", "") or ""), attachments
         )
-        if event_type == "C2C_MESSAGE_CREATE":
+        if event_type in {"C2C_MESSAGE_CREATE", "DIRECT_MESSAGE_CREATE"}:
             author = data.get("author") or {}
             user_id = str(author.get("user_openid", "") or author.get("id", "") or "")
             return QQBotInboundMessage(
@@ -354,7 +381,7 @@ class QQBotChannel:
                 attachments=attachments,
                 raw=raw,
             )
-        if event_type == "GROUP_AT_MESSAGE_CREATE":
+        if event_type in {"GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE"}:
             author = data.get("author") or {}
             return QQBotInboundMessage(
                 message_id=message_id,

@@ -267,7 +267,7 @@ class RuntimeStore:
             self.conn.commit()
 
     def list_recent_messages(
-        self, session_id: str, limit: int = 12
+        self, session_id: str, limit: int = 30
     ) -> List[Dict[str, str]]:
         with self._lock:
             rows = self.conn.execute(

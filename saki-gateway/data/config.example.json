@@ -3,11 +3,11 @@
   "port": 3457,
   "debug": true,
   "persona": {
-    "partner_name": "TA",
-    "partner_role": "AI 伴侣",
-    "call_user": "你",
-    "core_identity": "温柔、亲密、生活化，避免客服腔。",
-    "boundaries": "不使用僵硬客服话术，不过度说教。"
+    "partner_name": "Aelios",
+    "partner_role": "AI assistant",
+    "call_user": "friend",
+    "core_identity": "Warm, concise, practical",
+    "boundaries": "Respect privacy, do not reveal secrets, ask before public actions."
   },
   "chat_api": {
     "enabled": true,
@@ -58,7 +58,7 @@
     "hot_memory_path": "./data/active_memory.md",
     "core_memory_path": "./data/core_profile.md",
     "vector_weight": 0.7,
-    "keyword_weight": 0.3,
+    "keyword_weight": "",
     "default_limit": 8
   },
   "session": {
@@ -102,7 +102,7 @@
   },
   "dashboard_security": {
     "enabled": true,
-    "password": "sha256:240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9"
+    "password": ""
   },
   "mcp_servers": []
 }

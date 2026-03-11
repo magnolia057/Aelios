@@ -244,7 +244,12 @@ class GatewayApp:
         }
 
     def start_channels(self) -> None:
-        self._start_channels_best_effort()
+        if self.feishu_channel is not None:
+            self.feishu_channel.start(self.handle_feishu_message)
+        if self.qqbot_channel is not None:
+            self.qqbot_channel.start(self.handle_qqbot_message)
+        if self.napcat_channel is not None:
+            self.napcat_channel.start(self.handle_napcat_message)
         self.scheduler.start()
 
     def shutdown(self) -> None:
@@ -269,38 +274,14 @@ class GatewayApp:
         self.feishu_channel = self._build_feishu_channel()
         self.qqbot_channel = self._build_qqbot_channel()
         self.napcat_channel = self._build_napcat_channel()
-        warnings = self._start_channels_best_effort()
+        if self.feishu_channel is not None:
+            self.feishu_channel.start(self.handle_feishu_message)
+        if self.qqbot_channel is not None:
+            self.qqbot_channel.start(self.handle_qqbot_message)
+        if self.napcat_channel is not None:
+            self.napcat_channel.start(self.handle_napcat_message)
         self.scheduler.start()
-        response = {"config": self.public_config_payload()}
-        if warnings:
-            response["warnings"] = warnings
-        return response
-
-    def _start_channels_best_effort(self) -> list[Dict[str, str]]:
-        warnings: list[Dict[str, str]] = []
-        channels = [
-            ("feishu", self.feishu_channel, self.handle_feishu_message),
-            ("qqbot", self.qqbot_channel, self.handle_qqbot_message),
-            ("qq", self.napcat_channel, self.handle_napcat_message),
-        ]
-        for channel_name, channel, handler in channels:
-            if channel is None:
-                continue
-            try:
-                channel.start(handler)
-            except Exception as error:
-                warnings.append(
-                    {
-                        "channel": channel_name,
-                        "error": str(error),
-                    }
-                )
-                self._record_event(
-                    "channel_start_failed",
-                    {"channel": channel_name, "error": str(error)},
-                    channel=channel_name,
-                )
-        return warnings
+        return {"config": self.public_config_payload()}
 
     def chat_complete(self, body: Dict[str, Any]) -> Dict[str, Any]:
         messages = self._coerce_messages(body)
@@ -713,6 +694,7 @@ class GatewayApp:
             "你输出给系统，不输出给最终用户；工具结果会回流给聊天核。",
             f"当前伴侣名称：{config.persona.partner_name}；伴侣身份：{config.persona.partner_role}。",
         ]
+        tool_contexts = self._dedupe_tool_contexts(tool_contexts)
         if tool_contexts:
             lines = []
             for index, item in enumerate(tool_contexts, start=1):
@@ -727,7 +709,7 @@ class GatewayApp:
         if session_id:
             recent_messages = self.runtime_store.list_recent_messages(
                 session_id,
-                limit=min(6, self.config_store.config.session.recent_message_limit),
+                limit=max(30, self.config_store.config.session.recent_message_limit),
             )
         if len(messages) > 1:
             recent_messages = []
@@ -876,11 +858,11 @@ class GatewayApp:
             messages=messages,
             profile_id=profile_id,
             session_id=session.session_id,
-            channel="qq",
+            channel="qqbot",
             temperature=0.7,
             event_type="qq_chat_respond",
             event_payload={
-                "channel": "qq",
+                "channel": "qqbot",
                 "user_id": inbound.get("user_id", ""),
                 "group_id": inbound.get("group_id", ""),
                 "message_type": inbound.get("message_type", "private"),
@@ -1030,6 +1012,7 @@ class GatewayApp:
             system_parts.append(
                 "以下是近期活跃记忆，请在相关时自然接住。\n\n" + active_memory
             )
+        tool_contexts = self._dedupe_tool_contexts(tool_contexts, active_memory)
         if tool_contexts:
             context_lines = []
             for index, item in enumerate(tool_contexts, start=1):
@@ -1132,7 +1115,27 @@ class GatewayApp:
                 image_url = str(
                     attachment.get("url", "") or attachment.get("image_url", "") or ""
                 ).strip()
+                image_key = str(attachment.get("image_key", "") or "").strip()
                 note = str(attachment.get("note", "") or "").strip()
+                source = str(attachment.get("source", "") or "").strip().lower()
+                message_id = str(attachment.get("message_id", "") or "").strip()
+                if not image_url and image_key and source == "feishu" and message_id and self.feishu_channel:
+                    try:
+                        tmp_dir = self.root / "data" / "tmp" / "feishu"
+                        image_url = self.feishu_channel.download_message_resource(
+                            message_id, "image", image_key, str(tmp_dir)
+                        )
+                    except Exception as error:
+                        tool_contexts.append(
+                            {
+                                "type": "image",
+                                "url": "",
+                                "note": note,
+                                "context": f"飞书图片下载失败：{error}",
+                                "route_used": "failed",
+                                "provider_used": "none",
+                            }
+                        )
                 if image_url:
                     context = prepare_image_context(
                         self.config_store.config, image_url, note, self.root
@@ -1417,8 +1420,6 @@ class GatewayApp:
     def _prepare_outbound_message(
         self, profile_id: str, content: str, source: str
     ) -> str:
-        if source == "scheduled_reminder":
-            return content
         return self._synthesize_outbound_message(profile_id, content, source)
 
     def _synthesize_outbound_message(
@@ -1579,8 +1580,13 @@ class GatewayApp:
 
     def _deliver_due_reminder(self, reminder_id: str) -> None:
         reminder = self.runtime_store.get_reminder(reminder_id)
+        reminder_prompt = (
+            "这是一个已到时间的提醒，请先理解提醒意图，再以你自己的语气自然发给用户。"
+            "不要原样转抄，不要提系统、定时器、提醒服务或自动发送。"
+            f"\n提醒内容：{reminder.content}"
+        )
         result = self.dispatch_proactive_message(
-            reminder.profile_id, reminder.content, "scheduled_reminder"
+            reminder.profile_id, reminder_prompt, "scheduled_reminder"
         )
         if result.get("delivered"):
             self.runtime_store.mark_reminder_delivered(reminder_id)
@@ -1748,26 +1754,58 @@ class GatewayApp:
 
     def _render_active_memory(self) -> str:
         lines = [f"更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
+        preferred_categories = {"preference", "promise", "anniversary", "identity", "relationship"}
         recent_memories = self.memory_store.list_memories(
-            limit=6, memory_kind="long_term"
+            limit=20, memory_kind="long_term"
         )
         recent_memories = [
-            record for record in recent_memories if record.category != "memory_refresh"
-        ]
+            record
+            for record in recent_memories
+            if record.category != "memory_refresh"
+            and record.category in preferred_categories
+        ][:4]
         if recent_memories:
             lines.append("")
-            lines.append("长期记忆:")
+            lines.append("当前高价值背景:")
             for record in recent_memories:
                 lines.append(
-                    f"- [{record.category}] {record.key}: {record.content[:160]}"
+                    f"- [{record.category}] {record.key}: {record.content[:120]}"
                 )
-        recent_logs = self.memory_store.list_memories(limit=1, memory_kind="daily_log")
-        if recent_logs:
+        else:
             lines.append("")
-            lines.append("今日日志:")
-            for record in recent_logs:
-                lines.append(f"- {record.content[:220]}")
+            lines.append("当前高价值背景: 暂无新增，主要依赖核心档案。")
         return "\n".join(lines).strip() + "\n"
+
+    def _dedupe_tool_contexts(
+        self, tool_contexts: list[Dict[str, Any]], active_memory: str = ""
+    ) -> list[Dict[str, Any]]:
+        deduped: list[Dict[str, Any]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        normalized_active = " ".join((active_memory or "").split())
+        for item in tool_contexts:
+            item_type = str(item.get("type", "") or "")
+            context = str(item.get("context", "") or "").strip()
+            if item_type == "memory_search":
+                kept_lines: list[str] = []
+                for raw_line in context.splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    normalized_line = " ".join(line.split())
+                    if normalized_line and normalized_line in normalized_active:
+                        continue
+                    kept_lines.append(line)
+                context = "\n".join(dict.fromkeys(kept_lines)).strip()
+                if not context:
+                    continue
+                item = dict(item)
+                item["context"] = context
+            fingerprint = (item_type, " ".join(context.split()))
+            if fingerprint in seen_pairs:
+                continue
+            seen_pairs.add(fingerprint)
+            deduped.append(item)
+        return deduped
 
     def _refresh_active_memory(self) -> None:
         self._write_text_file(self._active_memory_file(), self._render_active_memory())
@@ -2030,24 +2068,46 @@ class GatewayApp:
             return
         log_id = self._daily_log_memory_id(profile_id, day_start)
         existing = self.memory_store.get_memory(log_id)
-        if existing is not None and "### 晚安前补全摘要" in (existing.content or ""):
+        if existing is None:
+            self._update_daily_log(profile_id=profile_id, session_id=session_id)
             return
+
+        match = re.search(r"已整理\s+(\d+)\s+条消息", existing.content or "")
+        processed_count = max(0, int(match.group(1))) if match else 0
+        if len(user_messages) <= processed_count:
+            return
+
+        remaining_user_messages = user_messages[processed_count:]
+        remaining_ids = [int(item.get("id", 0) or 0) for item in remaining_user_messages]
+        if not remaining_ids:
+            return
+        first_target_id = min(remaining_ids)
+        last_target_id = max(remaining_ids)
+        selected = [
+            item
+            for item in all_messages
+            if first_target_id <= int(item.get("id", 0) or 0) <= last_target_id
+        ]
+        if not selected:
+            return
+
         summary = self._summarize_daily_log_chunk(
             profile_id=profile_id,
             day=day_start,
-            messages=all_messages,
-            chunk_start=1,
+            messages=selected,
+            chunk_start=processed_count + 1,
             chunk_end=len(user_messages),
         )
         sections: list[str] = []
-        if existing is not None:
-            marker = "今日日志摘要："
-            existing_content = existing.content or ""
-            if marker in existing_content:
-                tail = existing_content.split(marker, 1)[1].strip()
-                if tail:
-                    sections.append(tail)
-        sections.append(f"### 晚安前补全摘要（1-{len(user_messages)}）\n{summary}")
+        marker = "今日日志摘要："
+        existing_content = existing.content or ""
+        if marker in existing_content:
+            tail = existing_content.split(marker, 1)[1].strip()
+            if tail:
+                sections.append(tail)
+        sections.append(
+            f"### 晚安前补全摘要（{processed_count + 1}-{len(user_messages)}）\n{summary}"
+        )
         title, content = self._compose_daily_log_content(
             profile_id=profile_id,
             day=day_start,
@@ -2064,6 +2124,57 @@ class GatewayApp:
             session_id=self._daily_log_session_ref(profile_id, day_start),
         )
         self._refresh_active_memory()
+
+    def dedupe_daily_log(self, *, profile_id: str = "", day: Optional[datetime] = None) -> Dict[str, Any]:
+        target_day = day or self._local_day_bounds()[0]
+        target_profile = profile_id or "local-user"
+        log_id = self._daily_log_memory_id(target_profile, target_day)
+        record = self.memory_store.get_memory(log_id)
+        if record is None:
+            return {"ok": False, "reason": "daily log not found", "memory_id": log_id}
+        content = record.content or ""
+        lines = content.splitlines()
+        deduped_lines: list[str] = []
+        seen_sections: set[str] = set()
+        current_header = ""
+        buffer: list[str] = []
+
+        def flush_section() -> None:
+            nonlocal current_header, buffer
+            if current_header:
+                normalized = current_header + "\n" + "\n".join(buffer).strip()
+                if normalized.strip() and normalized not in seen_sections:
+                    seen_sections.add(normalized)
+                    deduped_lines.append(current_header)
+                    deduped_lines.extend(buffer)
+            else:
+                for line in buffer:
+                    deduped_lines.append(line)
+            current_header = ""
+            buffer = []
+
+        for line in lines:
+            if line.startswith("### "):
+                flush_section()
+                current_header = line
+                buffer = []
+            else:
+                buffer.append(line)
+        flush_section()
+        new_content = "\n".join(deduped_lines).strip()
+        changed = new_content != content.strip()
+        if changed:
+            self.memory_store.upsert_memory(
+                memory_id=record.id,
+                key=record.key,
+                content=new_content,
+                memory_kind=record.memory_kind,
+                category=record.category,
+                importance=record.importance,
+                session_id=record.session_id,
+            )
+            self._refresh_active_memory()
+        return {"ok": True, "changed": changed, "memory_id": record.id}
 
     def _run_memory_digest(self, profile_id: str = "", session_id: str = "") -> None:
         provider = self._preferred_extraction_provider()

@@ -271,7 +271,8 @@ class MemoryStore:
         limit: int = 8,
         memory_kind: str = "long_term",
     ) -> List[MemoryRecord]:
-        fallback_limit = max(limit * 3, limit)
+        fallback_limit = max(limit * 6, 24)
+        tokens = [token.strip() for token in query.replace("，", " ").replace(",", " ").split() if token.strip()]
         try:
             with self._lock:
                 keyword_rows = self.conn.execute(
@@ -283,22 +284,32 @@ class MemoryStore:
                 ORDER BY keyword_score
                 LIMIT ?
                     """,
-                    (query, memory_kind, fallback_limit),
+                    (" OR ".join(dict.fromkeys(tokens)) or query, memory_kind, fallback_limit),
                 ).fetchall()
         except sqlite3.Error:
             keyword_rows = []
 
         if not keyword_rows:
+            like_clauses = []
+            params: list[Any] = [memory_kind]
+            search_terms = tokens or [query]
+            for token in search_terms[:8]:
+                like_clauses.append("key LIKE ? OR content LIKE ?")
+                params.extend([f"%{token}%", f"%{token}%"])
+            where_clause = " OR ".join(f"({clause})" for clause in like_clauses) or "(key LIKE ? OR content LIKE ?)"
+            if not like_clauses:
+                params.extend([f"%{query}%", f"%{query}%"])
+            params.append(fallback_limit)
             with self._lock:
                 keyword_rows = self.conn.execute(
-                    """
+                    f"""
                 SELECT *, 0.5 AS keyword_score
                 FROM memories
-                WHERE memory_kind = ? AND (key LIKE ? OR content LIKE ?)
+                WHERE memory_kind = ? AND ({where_clause})
                 ORDER BY updated_at DESC
                 LIMIT ?
                     """,
-                    (memory_kind, f"%{query}%", f"%{query}%", fallback_limit),
+                    tuple(params),
                 ).fetchall()
 
         keyword_hits = []
